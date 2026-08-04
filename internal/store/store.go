@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS debates (
 	id            TEXT PRIMARY KEY,
 	question      TEXT NOT NULL,
+	mode          TEXT NOT NULL DEFAULT 'moderator',
 	status        TEXT NOT NULL,
 	rounds        INTEGER NOT NULL,
 	current_round INTEGER NOT NULL DEFAULT 0,
@@ -56,6 +58,8 @@ CREATE TABLE IF NOT EXISTS messages (
 	speaker_name TEXT NOT NULL,
 	kind         TEXT NOT NULL,
 	text         TEXT NOT NULL,
+	support_id   TEXT NOT NULL DEFAULT '',
+	support_name TEXT NOT NULL DEFAULT '',
 	created_at   TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_debate ON messages(debate_id, seq);
@@ -72,6 +76,16 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("миграция схемы: %w", err)
+	}
+	// Догоняющие миграции для баз, созданных до появления колонок.
+	for _, stmt := range []string{
+		`ALTER TABLE debates ADD COLUMN mode TEXT NOT NULL DEFAULT 'moderator'`,
+		`ALTER TABLE messages ADD COLUMN support_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE messages ADD COLUMN support_name TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return nil, fmt.Errorf("миграция схемы: %w", err)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -116,10 +130,10 @@ func (s *Store) scanAgent(row *sql.Row) (core.Agent, error) {
 // CreateDebate сохраняет новую дискуссию.
 func (s *Store) CreateDebate(d core.Debate) error {
 	_, err := s.db.Exec(
-		`INSERT INTO debates (id, question, status, rounds, current_round, turn_timeout,
+		`INSERT INTO debates (id, question, mode, status, rounds, current_round, turn_timeout,
 		                      creator_id, turn_agent_id, turn_deadline, consensus, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		d.ID, d.Question, d.Status, d.Rounds, d.CurrentRound, d.TurnTimeout,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.Question, d.Mode, d.Status, d.Rounds, d.CurrentRound, d.TurnTimeout,
 		d.CreatorID, d.TurnAgentID, nullTime(d.TurnDeadline), boolInt(d.Consensus), d.CreatedAt,
 	)
 	return err
@@ -166,7 +180,7 @@ func (s *Store) ActiveDebates() ([]core.Debate, error) {
 
 func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 	rows, err := s.db.Query(
-		`SELECT id, question, status, rounds, current_round, turn_timeout,
+		`SELECT id, question, mode, status, rounds, current_round, turn_timeout,
 		        creator_id, turn_agent_id, turn_deadline, consensus, created_at
 		 FROM debates `+tail, args...)
 	if err != nil {
@@ -178,7 +192,7 @@ func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 		var d core.Debate
 		var deadline sql.NullTime
 		var consensus int
-		if err := rows.Scan(&d.ID, &d.Question, &d.Status, &d.Rounds, &d.CurrentRound,
+		if err := rows.Scan(&d.ID, &d.Question, &d.Mode, &d.Status, &d.Rounds, &d.CurrentRound,
 			&d.TurnTimeout, &d.CreatorID, &d.TurnAgentID, &deadline, &consensus, &d.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -226,9 +240,11 @@ func (s *Store) Participants(debateID string) ([]core.Participant, error) {
 // AddMessage сохраняет запись протокола и возвращает её порядковый номер.
 func (s *Store) AddMessage(m core.Message) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO messages (debate_id, round, speaker_id, speaker_name, kind, text, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		m.DebateID, m.Round, m.SpeakerID, m.SpeakerName, m.Kind, m.Text, m.CreatedAt,
+		`INSERT INTO messages (debate_id, round, speaker_id, speaker_name, kind, text,
+		                       support_id, support_name, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.DebateID, m.Round, m.SpeakerID, m.SpeakerName, m.Kind, m.Text,
+		m.SupportID, m.SupportName, m.CreatedAt,
 	)
 	if err != nil {
 		return 0, err
@@ -239,7 +255,8 @@ func (s *Store) AddMessage(m core.Message) (int64, error) {
 // Messages возвращает протокол дискуссии после указанного seq.
 func (s *Store) Messages(debateID string, afterSeq int64) ([]core.Message, error) {
 	rows, err := s.db.Query(
-		`SELECT seq, debate_id, round, speaker_id, speaker_name, kind, text, created_at
+		`SELECT seq, debate_id, round, speaker_id, speaker_name, kind, text,
+		        support_id, support_name, created_at
 		 FROM messages WHERE debate_id = ? AND seq > ? ORDER BY seq`, debateID, afterSeq)
 	if err != nil {
 		return nil, err
@@ -249,7 +266,7 @@ func (s *Store) Messages(debateID string, afterSeq int64) ([]core.Message, error
 	for rows.Next() {
 		var m core.Message
 		if err := rows.Scan(&m.Seq, &m.DebateID, &m.Round, &m.SpeakerID,
-			&m.SpeakerName, &m.Kind, &m.Text, &m.CreatedAt); err != nil {
+			&m.SpeakerName, &m.Kind, &m.Text, &m.SupportID, &m.SupportName, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

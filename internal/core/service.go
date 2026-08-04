@@ -51,8 +51,11 @@ type Storage interface {
 // Moderator — серверный модератор дебатов.
 type Moderator interface {
 	Name() string
-	// CheckRound подводит итог раунда и решает, достигнут ли консенсус.
+	// CheckRound подводит итог раунда и решает, достигнут ли консенсус
+	// (режим moderator).
 	CheckRound(ctx context.Context, question, transcript string, round int) (consensus bool, summary string, err error)
+	// Summary подводит итог раунда без решения о консенсусе (режим hybrid).
+	Summary(ctx context.Context, question, transcript string, round int) (string, error)
 	// Verdict выносит финальное решение по всей дискуссии.
 	Verdict(ctx context.Context, question, transcript string) (string, error)
 }
@@ -174,19 +177,27 @@ func (s *Service) Authenticate(apiKey string) (Agent, error) {
 // --- Жизненный цикл дебатов ---
 
 // DebateView — дискуссия с участниками для выдачи наружу.
+// Votes заполняется в режиме hybrid — текущие голоса активных спикеров.
 type DebateView struct {
 	Debate
 	TurnAgentID   string        `json:"turn_agent_id,omitempty"`
 	TurnAgentName string        `json:"turn_agent_name,omitempty"`
 	TurnDeadline  *time.Time    `json:"turn_deadline,omitempty"`
 	Participants  []Participant `json:"participants"`
+	Votes         []Vote        `json:"votes,omitempty"`
 }
 
 // CreateDebate создаёт дискуссию в статусе open; создатель сразу участник.
-func (s *Service) CreateDebate(creator Agent, question, stance string, rounds, turnTimeoutSec int) (DebateView, error) {
+func (s *Service) CreateDebate(creator Agent, question, stance string, mode DebateMode, rounds, turnTimeoutSec int) (DebateView, error) {
 	question = strings.TrimSpace(question)
 	if question == "" || len(question) > 4000 {
 		return DebateView{}, fmt.Errorf("%w: вопрос обязателен, до 4000 символов", ErrValidation)
+	}
+	if mode == "" {
+		mode = ModeModerator
+	}
+	if mode != ModeModerator && mode != ModeHybrid {
+		return DebateView{}, fmt.Errorf("%w: mode — moderator или hybrid", ErrValidation)
 	}
 	if rounds == 0 {
 		rounds = DefaultRounds
@@ -203,6 +214,7 @@ func (s *Service) CreateDebate(creator Agent, question, stance string, rounds, t
 	d := Debate{
 		ID:          newID("dbt"),
 		Question:    question,
+		Mode:        mode,
 		Status:      StatusOpen,
 		Rounds:      rounds,
 		TurnTimeout: turnTimeoutSec,
@@ -285,7 +297,9 @@ func (s *Service) StartDebate(agent Agent, debateID string) (DebateView, error) 
 }
 
 // PostArgument принимает реплику от агента, чья сейчас очередь.
-func (s *Service) PostArgument(ctx context.Context, agent Agent, debateID, text string) (Message, error) {
+// supportID — необязательный голос «поддерживаю позицию этого участника»
+// (пустой = свою); в режиме hybrid голоса определяют консенсус.
+func (s *Service) PostArgument(ctx context.Context, agent Agent, debateID, text, supportID string) (Message, error) {
 	text = strings.TrimSpace(text)
 	if text == "" || len(text) > MaxArgumentLen {
 		return Message{}, fmt.Errorf("%w: текст обязателен, до %d символов", ErrValidation, MaxArgumentLen)
@@ -302,7 +316,23 @@ func (s *Service) PostArgument(ctx context.Context, agent Agent, debateID, text 
 	if d.TurnAgentID != agent.ID {
 		return Message{}, ErrNotYourTurn
 	}
-	msg := s.appendMessage(debateID, d.CurrentRound, agent.ID, agent.Name, KindArgument, text)
+	supportName := ""
+	if supportID != "" {
+		parts, err := s.store.Participants(debateID)
+		if err != nil {
+			return Message{}, err
+		}
+		for _, p := range parts {
+			if p.AgentID == supportID {
+				supportName = p.Name
+				break
+			}
+		}
+		if supportName == "" {
+			return Message{}, fmt.Errorf("%w: support_agent_id должен указывать на участника дебатов", ErrValidation)
+		}
+	}
+	msg := s.appendArgument(debateID, d.CurrentRound, agent, text, supportID, supportName)
 	if err := s.advanceTurn(ctx, d); err != nil {
 		return Message{}, err
 	}
@@ -345,12 +375,16 @@ func (s *Service) advanceTurn(ctx context.Context, d Debate) error {
 	return nil
 }
 
-// moderate подводит итог раунда: проверка консенсуса и/или вердикт.
-// Запускается в отдельной горутине, лок берёт только на запись результата.
+// moderate подводит итог раунда. Запускается в отдельной горутине,
+// лок берёт только на запись результата.
 func (s *Service) moderate(ctx context.Context, debateID string) {
 	d, err := s.store.GetDebate(debateID)
 	if err != nil {
 		s.log.Error("модерация: чтение дебатов", "debate", debateID, "err", err)
+		return
+	}
+	if d.Mode == ModeHybrid {
+		s.moderateHybrid(ctx, d)
 		return
 	}
 	transcript, err := s.renderTranscript(debateID)
@@ -417,6 +451,181 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	}
 	s.hub.Publish(Event{Type: EventTurn, DebateID: d.ID, Round: d.CurrentRound,
 		AgentID: parts[0].AgentID, AgentName: parts[0].Name, Deadline: d.TurnDeadline})
+}
+
+// moderateHybrid — режим hybrid: консенсус определяют голоса участников
+// (единогласие активных спикеров), LLM-модератор опционален.
+func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
+	parts, err := s.store.Participants(d.ID)
+	if err != nil {
+		s.log.Error("гибрид: участники", "debate", d.ID, "err", err)
+		return
+	}
+	msgs, err := s.store.Messages(d.ID, 0)
+	if err != nil {
+		s.log.Error("гибрид: протокол", "debate", d.ID, "err", err)
+		return
+	}
+	votes := currentVotes(parts, msgs)
+	consensus := unanimity(votes)
+	lastRound := d.CurrentRound >= d.Rounds
+
+	if !lastRound && !consensus {
+		// Промежуточное резюме — опциональный слой: без LLM просто едем дальше.
+		transcript := renderTranscriptText(msgs)
+		if summary, err := s.moderator.Summary(ctx, d.Question, transcript, d.CurrentRound); err != nil {
+			s.log.Warn("гибрид: резюме раунда недоступно", "debate", d.ID, "err", err)
+		} else {
+			s.lock()
+			s.appendMessage(d.ID, d.CurrentRound, "", s.moderator.Name(), KindSummary, summary)
+			s.unlock()
+		}
+		s.lock()
+		defer s.unlock()
+		d.Status = StatusRunning
+		d.CurrentRound++
+		d.TurnAgentID = parts[0].AgentID
+		d.TurnDeadline = time.Now().Add(time.Duration(d.TurnTimeout) * time.Second)
+		if err := s.store.UpdateDebate(d); err != nil {
+			s.log.Error("гибрид: сохранение раунда", "debate", d.ID, "err", err)
+			return
+		}
+		s.hub.Publish(Event{Type: EventTurn, DebateID: d.ID, Round: d.CurrentRound,
+			AgentID: parts[0].AgentID, AgentName: parts[0].Name, Deadline: d.TurnDeadline})
+		return
+	}
+
+	// Завершение: вердикт LLM, при недоступности — детерминированный по голосам.
+	verdict, err := s.moderator.Verdict(ctx, d.Question, renderTranscriptText(msgs))
+	speaker := s.moderator.Name()
+	if err != nil {
+		s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)
+		verdict = hybridVerdict(votes, msgs, consensus)
+		speaker = "система"
+	}
+	s.lock()
+	defer s.unlock()
+	s.appendMessage(d.ID, d.CurrentRound, "", speaker, KindVerdict, verdict)
+	d.Status = StatusConcluded
+	d.Consensus = consensus
+	d.TurnAgentID = ""
+	d.TurnDeadline = time.Time{}
+	if err := s.store.UpdateDebate(d); err != nil {
+		s.log.Error("гибрид: сохранение статуса", "debate", d.ID, "err", err)
+	}
+	s.hub.Publish(Event{Type: EventConcluded, DebateID: d.ID, Round: d.CurrentRound, Consensus: consensus})
+}
+
+// currentVotes — последние голоса активных спикеров: чью позицию поддерживает
+// каждый участник по его последней реплике (без явного голоса — свою).
+func currentVotes(parts []Participant, msgs []Message) []Vote {
+	names := make(map[string]string, len(parts))
+	for _, p := range parts {
+		names[p.AgentID] = p.Name
+	}
+	last := make(map[string]string) // speakerID -> supportID
+	var order []string
+	for _, m := range msgs {
+		if m.Kind != KindArgument || m.SpeakerID == "" {
+			continue
+		}
+		if _, seen := last[m.SpeakerID]; !seen {
+			order = append(order, m.SpeakerID)
+		}
+		target := m.SupportID
+		if target == "" {
+			target = m.SpeakerID // без явного голоса — стоит на своей позиции
+		}
+		last[m.SpeakerID] = target
+	}
+	votes := make([]Vote, 0, len(last))
+	for _, id := range order {
+		votes = append(votes, Vote{
+			AgentID:      id,
+			AgentName:    names[id],
+			SupportsID:   last[id],
+			SupportsName: names[last[id]],
+		})
+	}
+	return votes
+}
+
+// unanimity — все активные спикеры (минимум два) поддерживают одну позицию.
+func unanimity(votes []Vote) bool {
+	if len(votes) < 2 {
+		return false
+	}
+	target := votes[0].SupportsID
+	for _, v := range votes[1:] {
+		if v.SupportsID != target {
+			return false
+		}
+	}
+	return true
+}
+
+// hybridVerdict — детерминированный вердикт по голосам, когда LLM недоступен.
+func hybridVerdict(votes []Vote, msgs []Message, consensus bool) string {
+	var sb strings.Builder
+	if consensus {
+		sb.WriteString("Консенсус достигнут голосованием участников.\n\n")
+	} else {
+		sb.WriteString("Консенсус не достигнут. Дебаты завершены по исчерпанию раундов.\n\n")
+	}
+	sb.WriteString("Голоса участников:\n")
+	tally := make(map[string]int)
+	for _, v := range votes {
+		fmt.Fprintf(&sb, "- %s → %s\n", v.AgentName, v.SupportsName)
+		tally[v.SupportsID]++
+	}
+	// Позиция с наибольшей поддержкой (если лидер единственный).
+	best, bestCount, unique := "", 0, false
+	for id, n := range tally {
+		switch {
+		case n > bestCount:
+			best, bestCount, unique = id, n, true
+		case n == bestCount:
+			unique = false
+		}
+	}
+	if unique {
+		var name, text string
+		for _, m := range msgs {
+			if m.Kind == KindArgument && m.SpeakerID == best {
+				name, text = m.SpeakerName, m.Text // последняя реплика победителя
+			}
+		}
+		if text != "" {
+			fmt.Fprintf(&sb, "\nНаибольшую поддержку получила позиция участника %s (голосов: %d).\nЕго итоговая реплика:\n\n%s\n", name, bestCount, text)
+		}
+	} else if len(tally) > 0 {
+		sb.WriteString("\nГолоса разделились поровну — итоговая позиция не определена.\n")
+	}
+	return sb.String()
+}
+
+// appendArgument сохраняет реплику участника с голосом. Вызывается под локом.
+func (s *Service) appendArgument(debateID string, round int, agent Agent, text, supportID, supportName string) Message {
+	m := Message{
+		DebateID:    debateID,
+		Round:       round,
+		SpeakerID:   agent.ID,
+		SpeakerName: agent.Name,
+		Kind:        KindArgument,
+		Text:        text,
+		SupportID:   supportID,
+		SupportName: supportName,
+		CreatedAt:   time.Now().UTC(),
+	}
+	seq, err := s.store.AddMessage(m)
+	if err != nil {
+		s.log.Error("сохранение сообщения", "debate", debateID, "err", err)
+		return m
+	}
+	m.Seq = seq
+	s.hub.Publish(Event{Type: EventMessage, DebateID: debateID, Round: round,
+		AgentID: agent.ID, AgentName: agent.Name, Message: &m})
+	return m
 }
 
 // appendMessage сохраняет сообщение и публикует событие. Вызывается под локом.
@@ -535,6 +744,10 @@ func (s *Service) renderTranscript(debateID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return renderTranscriptText(msgs), nil
+}
+
+func renderTranscriptText(msgs []Message) string {
 	var sb strings.Builder
 	round := 0
 	for _, m := range msgs {
@@ -542,9 +755,13 @@ func (s *Service) renderTranscript(debateID string) (string, error) {
 			round = m.Round
 			fmt.Fprintf(&sb, "--- Раунд %d ---\n\n", round)
 		}
-		fmt.Fprintf(&sb, "[%s]:\n%s\n\n", m.SpeakerName, strings.TrimSpace(m.Text))
+		header := m.SpeakerName
+		if m.SupportName != "" && m.SupportID != m.SpeakerID {
+			header += " (поддерживает позицию: " + m.SupportName + ")"
+		}
+		fmt.Fprintf(&sb, "[%s]:\n%s\n\n", header, strings.TrimSpace(m.Text))
 	}
-	return sb.String(), nil
+	return sb.String()
 }
 
 func (s *Service) view(d Debate) (DebateView, error) {
@@ -563,6 +780,11 @@ func (s *Service) view(d Debate) (DebateView, error) {
 		if !d.TurnDeadline.IsZero() {
 			t := d.TurnDeadline
 			v.TurnDeadline = &t
+		}
+	}
+	if d.Mode == ModeHybrid && d.Status != StatusOpen {
+		if msgs, err := s.store.Messages(d.ID, 0); err == nil {
+			v.Votes = currentVotes(parts, msgs)
 		}
 	}
 	return v, nil

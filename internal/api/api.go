@@ -110,13 +110,14 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 	var req struct {
 		Question       string `json:"question"`
 		Stance         string `json:"stance"`
+		Mode           string `json:"mode"`
 		Rounds         int    `json:"rounds"`
 		TurnTimeoutSec int    `json:"turn_timeout_sec"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	v, err := s.svc.CreateDebate(agent, req.Question, req.Stance, req.Rounds, req.TurnTimeoutSec)
+	v, err := s.svc.CreateDebate(agent, req.Question, req.Stance, core.DebateMode(req.Mode), req.Rounds, req.TurnTimeoutSec)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -190,12 +191,13 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request, agent core.A
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, agent core.Agent) {
 	var req struct {
-		Text string `json:"text"`
+		Text           string `json:"text"`
+		SupportAgentID string `json:"support_agent_id"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	msg, err := s.svc.PostArgument(r.Context(), agent, r.PathValue("id"), req.Text)
+	msg, err := s.svc.PostArgument(r.Context(), agent, r.PathValue("id"), req.Text, req.SupportAgentID)
 	if err != nil {
 		writeError(w, err)
 		return

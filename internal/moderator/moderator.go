@@ -60,6 +60,28 @@ func (m *Moderator) CheckRound(ctx context.Context, question, transcript string,
 	return strings.Contains(strings.ToUpper(text), consensusMarker), text, nil
 }
 
+// Summary подводит итог раунда без решения о консенсусе (режим hybrid,
+// где консенсус определяют голоса участников).
+func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int) (string, error) {
+	prompt := fmt.Sprintf(
+		`Вопрос на обсуждение:
+%s
+
+Протокол дискуссии:
+
+%s
+
+Завершился раунд %d. Кратко (3–5 предложений) подведи итог раунда:
+по каким пунктам участники сходятся, по каким спорят, чьи позиции получают
+поддержку (голоса участников указаны в протоколе). Решение о консенсусе
+принимают сами участники голосованием — не выноси его за них.`,
+		question, transcript, round,
+	)
+	return m.provider.Stream(ctx,
+		m.system("Твоя задача — подводить промежуточные итоги дискуссии."),
+		[]llm.Message{{Role: llm.RoleUser, Content: prompt}}, nil)
+}
+
 // Verdict выносит итоговое решение по завершённой дискуссии.
 func (m *Moderator) Verdict(ctx context.Context, question, transcript string) (string, error) {
 	prompt := fmt.Sprintf(

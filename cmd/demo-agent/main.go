@@ -13,6 +13,7 @@
 //	AGENT_MODEL         модель (по умолчанию claude-opus-5)
 //	AGENT_BASE_URL      base URL для openai-совместимых API
 //	DEBATE_QUESTION     если задан — агент создаёт и запускает дебаты
+//	DEBATE_MODE         moderator | hybrid (по умолчанию moderator)
 //	DEBATE_ROUNDS       число раундов (по умолчанию 2)
 //	DEBATE_PARTICIPANTS сколько участников ждать перед стартом (по умолчанию 3)
 //	TURN_TIMEOUT_SEC    таймаут хода (по умолчанию 120)
@@ -109,6 +110,7 @@ func findOrCreateDebate(ctx context.Context, c *client, stance string, log *slog
 		var d core.DebateView
 		if err := c.do(ctx, "POST", "/api/debates", map[string]any{
 			"question": question, "stance": stance,
+			"mode":   envOr("DEBATE_MODE", "moderator"),
 			"rounds": rounds, "turn_timeout_sec": timeout,
 		}, &d); err != nil {
 			return "", err
@@ -186,8 +188,8 @@ func debateLoop(ctx context.Context, c *client, provider llm.Provider,
 			return err
 		}
 
-		log.Info("моя очередь, генерирую аргумент", "round", st.CurrentRound)
-		text, err := generateArgument(ctx, provider, d.Question, name, persona, stance,
+		log.Info("моя очередь, генерирую аргумент", "round", st.CurrentRound, "mode", d.Mode)
+		text, err := generateArgument(ctx, provider, d, name, persona, stance,
 			msgs.Messages, st.CurrentRound, st.TotalRounds)
 		if err != nil {
 			// Пауза, чтобы не молотить LLM в цикле: ход либо получится
@@ -200,17 +202,26 @@ func debateLoop(ctx context.Context, c *client, provider llm.Provider,
 			}
 			continue
 		}
-		if err := c.do(ctx, "POST", "/api/debates/"+debateID+"/messages",
-			map[string]string{"text": text}, nil); err != nil {
+		body := map[string]string{"text": text}
+		if d.Mode == core.ModeHybrid {
+			cleanText, supportID, supportName := extractVote(text, name, d.Participants)
+			body["text"] = cleanText
+			if supportID != "" {
+				body["support_agent_id"] = supportID
+				log.Info("голосую", "за", supportName)
+			}
+		}
+		if err := c.do(ctx, "POST", "/api/debates/"+debateID+"/messages", body, nil); err != nil {
 			log.Error("отправка аргумента", "err", err)
 			continue
 		}
-		log.Info("аргумент отправлен", "round", st.CurrentRound, "len", len(text))
+		log.Info("аргумент отправлен", "round", st.CurrentRound, "len", len(body["text"]))
 	}
 }
 
-func generateArgument(ctx context.Context, provider llm.Provider, question,
+func generateArgument(ctx context.Context, provider llm.Provider, d core.DebateView,
 	name, persona, stance string, msgs []core.Message, round, total int) (string, error) {
+	question := d.Question
 	system := fmt.Sprintf(
 		`Ты участник экспертных дебатов. Твоё имя: %s.
 Твоя позиция и характер: %s
@@ -235,9 +246,51 @@ func generateArgument(ctx context.Context, provider llm.Provider, question,
 		prompt.WriteString(renderTranscript(msgs))
 	}
 	fmt.Fprintf(&prompt, "\nИдёт раунд %d из %d. Твоя очередь высказаться.", round, total)
+	if d.Mode == core.ModeHybrid {
+		names := make([]string, 0, len(d.Participants))
+		for _, p := range d.Participants {
+			names = append(names, p.Name)
+		}
+		fmt.Fprintf(&prompt, "\n\nЭти дебаты завершаются, когда все участники поддержат одну позицию."+
+			" Участники: %s. Последней строкой ответа напиши ровно: \"ПОДДЕРЖИВАЮ: <имя участника>\" —"+
+			" чью позицию ты сейчас считаешь верной (своё имя, если остаёшься при своей).",
+			strings.Join(names, ", "))
+	}
 
 	return provider.Stream(ctx, system,
 		[]llm.Message{{Role: llm.RoleUser, Content: prompt.String()}}, nil)
+}
+
+// extractVote вырезает из ответа LLM маркер "ПОДДЕРЖИВАЮ: <имя>" и
+// возвращает очищенный текст + голос (agent_id участника с этим именем).
+func extractVote(text, selfName string, parts []core.Participant) (string, string, string) {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-3; i-- {
+		line := strings.TrimSpace(lines[i])
+		rest, ok := cutPrefixFold(line, "ПОДДЕРЖИВАЮ:")
+		if !ok {
+			continue
+		}
+		votedName := strings.Trim(strings.TrimSpace(rest), `"'.«»`)
+		if strings.EqualFold(votedName, "себя") {
+			votedName = selfName
+		}
+		clean := strings.TrimSpace(strings.Join(append(lines[:i:i], lines[i+1:]...), "\n"))
+		for _, p := range parts {
+			if strings.EqualFold(p.Name, votedName) {
+				return clean, p.AgentID, p.Name
+			}
+		}
+		return clean, "", "" // имя не распознано — голос не отправляем
+	}
+	return text, "", ""
+}
+
+func cutPrefixFold(s, prefix string) (string, bool) {
+	if len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix) {
+		return s[len(prefix):], true
+	}
+	return "", false
 }
 
 func renderTranscript(msgs []core.Message) string {

@@ -11,6 +11,18 @@ type Agent struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// DebateMode — способ определения консенсуса.
+type DebateMode string
+
+const (
+	// ModeModerator — консенсус и вердикт определяет серверный LLM-модератор.
+	ModeModerator DebateMode = "moderator"
+	// ModeHybrid — консенсус определяют голоса участников (единогласие
+	// активных спикеров); LLM-модератор, если доступен, добавляет резюме
+	// и вердикт, иначе вердикт строится детерминированно по голосам.
+	ModeHybrid DebateMode = "hybrid"
+)
+
 // DebateStatus — стадия жизненного цикла дебатов.
 type DebateStatus string
 
@@ -29,6 +41,7 @@ const (
 type Debate struct {
 	ID           string       `json:"id"`
 	Question     string       `json:"question"`
+	Mode         DebateMode   `json:"mode"`
 	Status       DebateStatus `json:"status"`
 	Rounds       int          `json:"rounds"`
 	CurrentRound int          `json:"current_round"`
@@ -56,7 +69,8 @@ const (
 	KindSystem   = "system"   // служебное (пропуск хода и т.п.)
 )
 
-// Message — запись в протоколе дебатов.
+// Message — запись в протоколе дебатов. Support* — голос спикера:
+// чью позицию он поддерживает на момент этой реплики (режим hybrid).
 type Message struct {
 	Seq         int64     `json:"seq"`
 	DebateID    string    `json:"debate_id"`
@@ -65,7 +79,17 @@ type Message struct {
 	SpeakerName string    `json:"speaker_name"`
 	Kind        string    `json:"kind"`
 	Text        string    `json:"text"`
+	SupportID   string    `json:"support_id,omitempty"`
+	SupportName string    `json:"support_name,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+// Vote — текущий голос участника (последняя заявленная поддержка).
+type Vote struct {
+	AgentID      string `json:"agent_id"`
+	AgentName    string `json:"agent_name"`
+	SupportsID   string `json:"supports_id"`
+	SupportsName string `json:"supports_name"`
 }
 
 // Типы событий для подписчиков (SSE, long-poll).

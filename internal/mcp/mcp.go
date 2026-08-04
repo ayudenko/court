@@ -72,6 +72,7 @@ type listIn struct {
 type createIn struct {
 	Question       string `json:"question" jsonschema:"вопрос для обсуждения"`
 	Stance         string `json:"stance,omitempty" jsonschema:"ваша публичная позиция по вопросу"`
+	Mode           string `json:"mode,omitempty" jsonschema:"режим консенсуса: moderator (решает LLM-модератор сервиса, по умолчанию) или hybrid (консенсус определяют голоса участников — единогласие активных спикеров)"`
 	Rounds         int    `json:"rounds,omitempty" jsonschema:"число раундов, 1–10 (по умолчанию 3)"`
 	TurnTimeoutSec int    `json:"turn_timeout_sec,omitempty" jsonschema:"таймаут хода в секундах, 30–1800 (по умолчанию 180)"`
 }
@@ -91,8 +92,9 @@ type waitIn struct {
 }
 
 type postIn struct {
-	DebateID string `json:"debate_id" jsonschema:"идентификатор дебатов (dbt_...)"`
-	Text     string `json:"text" jsonschema:"текст вашего аргумента"`
+	DebateID       string `json:"debate_id" jsonschema:"идентификатор дебатов (dbt_...)"`
+	Text           string `json:"text" jsonschema:"текст вашего аргумента"`
+	SupportAgentID string `json:"support_agent_id,omitempty" jsonschema:"голос: agent_id участника, чью позицию вы сейчас поддерживаете (не указан — свою). В режиме hybrid единогласие голосов завершает дебаты консенсусом"`
 }
 
 func registerTools(server *sdk.Server, svc *core.Service) {
@@ -128,7 +130,7 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 		if err != nil {
 			return nil, nil, err
 		}
-		v, err := svc.CreateDebate(agent, in.Question, in.Stance, in.Rounds, in.TurnTimeoutSec)
+		v, err := svc.CreateDebate(agent, in.Question, in.Stance, core.DebateMode(in.Mode), in.Rounds, in.TurnTimeoutSec)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -210,7 +212,7 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 		if err != nil {
 			return nil, nil, err
 		}
-		msg, err := svc.PostArgument(ctx, agent, in.DebateID, in.Text)
+		msg, err := svc.PostArgument(ctx, agent, in.DebateID, in.Text, in.SupportAgentID)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -43,6 +43,7 @@ services:
         внедрения. Не доверяешь красивым теориям без плана реализации.
       # Создатель дебатов: задаёт вопрос, ждёт кворум и запускает.
       DEBATE_QUESTION: ${DEMO_QUESTION:-Стоит ли небольшой команде переходить с монолита на микросервисы?}
+      DEBATE_MODE: ${DEMO_MODE:-moderator}
       DEBATE_ROUNDS: ${DEMO_ROUNDS:-2}
       DEBATE_PARTICIPANTS: 3
       TURN_TIMEOUT_SEC: ${DEMO_TURN_TIMEOUT:-120}
