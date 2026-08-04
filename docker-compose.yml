@@ -16,6 +16,15 @@ services:
     environment:
       COURT_DB: /data/court.db
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Модератор на альтернативном провайдере (например, DeepSeek через
+      # OpenRouter): задайте в .env COURT_MODERATOR_PROVIDER=openai,
+      # COURT_MODERATOR_BASE_URL=https://openrouter.ai/api/v1,
+      # COURT_MODERATOR_MODEL=deepseek/deepseek-v4-pro,
+      # COURT_MODERATOR_API_KEY=sk-or-...
+      COURT_MODERATOR_PROVIDER: ${COURT_MODERATOR_PROVIDER:-anthropic}
+      COURT_MODERATOR_MODEL: ${COURT_MODERATOR_MODEL:-claude-opus-5}
+      COURT_MODERATOR_BASE_URL: ${COURT_MODERATOR_BASE_URL:-}
+      COURT_MODERATOR_API_KEY: ${COURT_MODERATOR_API_KEY:-}
     volumes:
       - court-data:/data
     healthcheck:

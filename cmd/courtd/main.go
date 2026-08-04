@@ -6,9 +6,10 @@
 //	COURT_DB                  путь к файлу SQLite (по умолчанию court.db)
 //	COURT_MODERATOR_PROVIDER  anthropic | openai (по умолчанию anthropic)
 //	COURT_MODERATOR_MODEL     модель модератора (по умолчанию claude-opus-5)
-//	COURT_MODERATOR_BASE_URL  base URL для openai-совместимых API
+//	COURT_MODERATOR_BASE_URL  base URL для openai-совместимых API (OpenRouter и т.п.)
+//	COURT_MODERATOR_API_KEY   ключ провайдера модератора; если пуст —
+//	                          ANTHROPIC_API_KEY / OPENAI_API_KEY
 //	COURT_MODERATOR_NAME      отображаемое имя (по умолчанию «Модератор»)
-//	ANTHROPIC_API_KEY / OPENAI_API_KEY — ключ провайдера модератора
 package main
 
 import (
@@ -85,22 +86,27 @@ func buildModerator(log *slog.Logger) (core.Moderator, error) {
 	providerName := envOr("COURT_MODERATOR_PROVIDER", "anthropic")
 	model := envOr("COURT_MODERATOR_MODEL", "claude-opus-5")
 	name := envOr("COURT_MODERATOR_NAME", "Модератор")
+	// Явный ключ модератора; если пуст, SDK возьмёт стандартную переменную
+	// провайдера (ANTHROPIC_API_KEY / OPENAI_API_KEY).
+	apiKey := os.Getenv("COURT_MODERATOR_API_KEY")
 
 	var provider llm.Provider
 	switch providerName {
 	case "anthropic":
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			log.Warn("ANTHROPIC_API_KEY не задан — модерация будет недоступна, дебаты завершатся без итогов")
+		if apiKey == "" && os.Getenv("ANTHROPIC_API_KEY") == "" {
+			log.Warn("ключ модератора не задан (COURT_MODERATOR_API_KEY / ANTHROPIC_API_KEY) — модерация будет недоступна")
 		}
-		provider = llm.NewAnthropicProvider("", model, 4096)
+		provider = llm.NewAnthropicProvider(apiKey, model, 4096)
 	case "openai":
-		if os.Getenv("OPENAI_API_KEY") == "" {
-			log.Warn("OPENAI_API_KEY не задан — модерация будет недоступна, дебаты завершатся без итогов")
+		if apiKey == "" && os.Getenv("OPENAI_API_KEY") == "" {
+			log.Warn("ключ модератора не задан (COURT_MODERATOR_API_KEY / OPENAI_API_KEY) — модерация будет недоступна")
 		}
-		provider = llm.NewOpenAICompatProvider("", os.Getenv("COURT_MODERATOR_BASE_URL"), model, 4096)
+		provider = llm.NewOpenAICompatProvider(apiKey, os.Getenv("COURT_MODERATOR_BASE_URL"), model, 4096)
 	default:
 		return nil, errors.New("COURT_MODERATOR_PROVIDER: ожидается anthropic или openai")
 	}
+	log.Info("модератор настроен", "provider", providerName, "model", model,
+		"base_url", os.Getenv("COURT_MODERATOR_BASE_URL"))
 	return moderator.New(name, provider), nil
 }
 

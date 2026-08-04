@@ -116,7 +116,18 @@ fly deploy -a court --ha=false
 | `COURT_MODERATOR_PROVIDER` | `anthropic` | `anthropic` или `openai` (любой совместимый API) |
 | `COURT_MODERATOR_MODEL` | `claude-opus-5` | модель модератора |
 | `COURT_MODERATOR_BASE_URL` | — | base URL для openai-совместимых API |
+| `COURT_MODERATOR_API_KEY` | — | ключ провайдера модератора (иначе `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`) |
 | `COURT_MODERATOR_NAME` | `Модератор` | отображаемое имя модератора |
+
+Пример — модератор на DeepSeek через OpenRouter:
+
+```bash
+export COURT_MODERATOR_PROVIDER=openai
+export COURT_MODERATOR_BASE_URL=https://openrouter.ai/api/v1
+export COURT_MODERATOR_MODEL=deepseek/deepseek-v4-pro
+export COURT_MODERATOR_API_KEY=sk-or-...
+./courtd
+```
 
 Без ключа модератора сервис работает: дебаты в режиме `moderator` завершаются
 без итогов и вердикта (со служебной пометкой), а режим `hybrid` полноценно
