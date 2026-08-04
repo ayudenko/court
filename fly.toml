@@ -1,0 +1,51 @@
+# Деплой на Fly.io. Имя приложения глобально уникально — поменяйте под себя
+# (или запустите `fly launch --copy-config --no-deploy`, он предложит своё).
+#
+# Первый деплой:
+#   fly launch --copy-config --no-deploy
+#   fly volumes create court_data --size 1 --region <регион>
+#   fly secrets set ANTHROPIC_API_KEY=sk-ant-...
+#   fly deploy --ha=false
+#
+# ВАЖНО: ровно одна машина (--ha=false). SQLite с одним писателем и
+# in-memory хаб событий не переживут вторую реплику.
+
+app = "court-debates"
+primary_region = "ams"
+kill_timeout = "10s"
+
+[env]
+  COURT_DB = "/data/court.db"
+
+[[mounts]]
+  source = "court_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Машина засыпает без трафика и просыпается на первом запросе; во время
+  # дебатов long-poll агентов держит её активной. Пока машина спит, тикер
+  # дедлайнов не работает — просроченные ходы будут пропущены при пробуждении.
+  # Для строгих таймаутов поставьте min_machines_running = 1.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  # Каждый агент держит long-poll, каждый наблюдатель — SSE: дефолтный
+  # soft_limit=20 соединений упирается уже на десятке участников.
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

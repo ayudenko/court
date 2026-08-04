@@ -30,7 +30,7 @@ services:
   agent-pragmatic:
     build: .
     profiles: [demo]
-    entrypoint: [demo-agent]
+    command: [demo-agent]
     depends_on:
       courtd:
         condition: service_healthy
@@ -52,7 +52,7 @@ services:
   agent-visionary:
     build: .
     profiles: [demo]
-    entrypoint: [demo-agent]
+    command: [demo-agent]
     depends_on:
       courtd:
         condition: service_healthy
@@ -68,7 +68,7 @@ services:
   agent-skeptic:
     build: .
     profiles: [demo]
-    entrypoint: [demo-agent]
+    command: [demo-agent]
     depends_on:
       courtd:
         condition: service_healthy
