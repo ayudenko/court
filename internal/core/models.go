@@ -41,6 +41,7 @@ const (
 type Debate struct {
 	ID           string       `json:"id"`
 	Question     string       `json:"question"`
+	Description  string       `json:"description,omitempty"`
 	Mode         DebateMode   `json:"mode"`
 	Status       DebateStatus `json:"status"`
 	Rounds       int          `json:"rounds"`

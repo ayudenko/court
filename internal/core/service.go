@@ -187,24 +187,41 @@ type DebateView struct {
 	Votes         []Vote        `json:"votes,omitempty"`
 }
 
+// CreateDebateParams — параметры новой дискуссии.
+type CreateDebateParams struct {
+	Question       string     // вопрос (обязателен, до 4000 символов)
+	Description    string     // контекст: предыстория, ограничения, критерии решения (до 8000)
+	Stance         string     // публичная позиция создателя
+	Mode           DebateMode // moderator (по умолчанию) | hybrid
+	Rounds         int
+	TurnTimeoutSec int
+}
+
 // CreateDebate создаёт дискуссию в статусе open; создатель сразу участник.
-func (s *Service) CreateDebate(creator Agent, question, stance string, mode DebateMode, rounds, turnTimeoutSec int) (DebateView, error) {
-	question = strings.TrimSpace(question)
+func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView, error) {
+	question := strings.TrimSpace(p.Question)
 	if question == "" || len(question) > 4000 {
 		return DebateView{}, fmt.Errorf("%w: вопрос обязателен, до 4000 символов", ErrValidation)
 	}
+	description := strings.TrimSpace(p.Description)
+	if len(description) > 8000 {
+		return DebateView{}, fmt.Errorf("%w: description до 8000 символов", ErrValidation)
+	}
+	mode := p.Mode
 	if mode == "" {
 		mode = ModeModerator
 	}
 	if mode != ModeModerator && mode != ModeHybrid {
 		return DebateView{}, fmt.Errorf("%w: mode — moderator или hybrid", ErrValidation)
 	}
+	rounds := p.Rounds
 	if rounds == 0 {
 		rounds = DefaultRounds
 	}
 	if rounds < 1 || rounds > MaxRounds {
 		return DebateView{}, fmt.Errorf("%w: раундов от 1 до %d", ErrValidation, MaxRounds)
 	}
+	turnTimeoutSec := p.TurnTimeoutSec
 	if turnTimeoutSec == 0 {
 		turnTimeoutSec = DefaultTimeoutSec
 	}
@@ -214,6 +231,7 @@ func (s *Service) CreateDebate(creator Agent, question, stance string, mode Deba
 	d := Debate{
 		ID:          newID("dbt"),
 		Question:    question,
+		Description: description,
 		Mode:        mode,
 		Status:      StatusOpen,
 		Rounds:      rounds,
@@ -226,10 +244,18 @@ func (s *Service) CreateDebate(creator Agent, question, stance string, mode Deba
 	if err := s.store.CreateDebate(d); err != nil {
 		return DebateView{}, err
 	}
-	if err := s.store.AddParticipant(d.ID, creator.ID, stance, time.Now().UTC()); err != nil {
+	if err := s.store.AddParticipant(d.ID, creator.ID, p.Stance, time.Now().UTC()); err != nil {
 		return DebateView{}, err
 	}
 	return s.view(d)
+}
+
+// subject — «о чём дебаты» для промптов модератора: вопрос + контекст.
+func subject(d Debate) string {
+	if d.Description == "" {
+		return d.Question
+	}
+	return d.Question + "\n\nКонтекст дискуссии:\n" + d.Description
 }
 
 // JoinDebate присоединяет агента к открытой дискуссии.
@@ -398,7 +424,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	if !lastRound {
 		var summary string
 		var err error
-		consensus, summary, err = s.moderator.CheckRound(ctx, d.Question, transcript, d.CurrentRound)
+		consensus, summary, err = s.moderator.CheckRound(ctx, subject(d), transcript, d.CurrentRound)
 		s.lock()
 		if err != nil {
 			s.log.Error("модерация: итог раунда", "debate", debateID, "err", err)
@@ -412,7 +438,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	}
 
 	if lastRound || consensus {
-		verdict, err := s.moderator.Verdict(ctx, d.Question, transcript)
+		verdict, err := s.moderator.Verdict(ctx, subject(d), transcript)
 		s.lock()
 		defer s.unlock()
 		if err != nil {
@@ -473,7 +499,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	if !lastRound && !consensus {
 		// Промежуточное резюме — опциональный слой: без LLM просто едем дальше.
 		transcript := renderTranscriptText(msgs)
-		if summary, err := s.moderator.Summary(ctx, d.Question, transcript, d.CurrentRound); err != nil {
+		if summary, err := s.moderator.Summary(ctx, subject(d), transcript, d.CurrentRound); err != nil {
 			s.log.Warn("гибрид: резюме раунда недоступно", "debate", d.ID, "err", err)
 		} else {
 			s.lock()
@@ -496,7 +522,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	}
 
 	// Завершение: вердикт LLM, при недоступности — детерминированный по голосам.
-	verdict, err := s.moderator.Verdict(ctx, d.Question, renderTranscriptText(msgs))
+	verdict, err := s.moderator.Verdict(ctx, subject(d), renderTranscriptText(msgs))
 	speaker := s.moderator.Name()
 	if err != nil {
 		s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)

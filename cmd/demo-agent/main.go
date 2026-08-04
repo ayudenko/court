@@ -13,6 +13,7 @@
 //	AGENT_MODEL         модель (по умолчанию claude-opus-5)
 //	AGENT_BASE_URL      base URL для openai-совместимых API
 //	DEBATE_QUESTION     если задан — агент создаёт и запускает дебаты
+//	DEBATE_DESCRIPTION  контекст дискуссии (для создателя)
 //	DEBATE_MODE         moderator | hybrid (по умолчанию moderator)
 //	DEBATE_ROUNDS       число раундов (по умолчанию 2)
 //	DEBATE_PARTICIPANTS сколько участников ждать перед стартом (по умолчанию 3)
@@ -110,8 +111,9 @@ func findOrCreateDebate(ctx context.Context, c *client, stance string, log *slog
 		var d core.DebateView
 		if err := c.do(ctx, "POST", "/api/debates", map[string]any{
 			"question": question, "stance": stance,
-			"mode":   envOr("DEBATE_MODE", "moderator"),
-			"rounds": rounds, "turn_timeout_sec": timeout,
+			"description": os.Getenv("DEBATE_DESCRIPTION"),
+			"mode":        envOr("DEBATE_MODE", "moderator"),
+			"rounds":      rounds, "turn_timeout_sec": timeout,
 		}, &d); err != nil {
 			return "", err
 		}
@@ -239,6 +241,9 @@ func generateArgument(ctx context.Context, provider llm.Provider, d core.DebateV
 
 	var prompt strings.Builder
 	fmt.Fprintf(&prompt, "Вопрос на обсуждение:\n%s\n\n", question)
+	if d.Description != "" {
+		fmt.Fprintf(&prompt, "Контекст дискуссии:\n%s\n\n", d.Description)
+	}
 	if len(msgs) == 0 {
 		prompt.WriteString("Дискуссия только начинается — ты выступаешь первым.\n")
 	} else {

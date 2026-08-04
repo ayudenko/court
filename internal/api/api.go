@@ -109,6 +109,7 @@ func (s *Server) handleMe(w http.ResponseWriter, _ *http.Request, agent core.Age
 func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agent core.Agent) {
 	var req struct {
 		Question       string `json:"question"`
+		Description    string `json:"description"`
 		Stance         string `json:"stance"`
 		Mode           string `json:"mode"`
 		Rounds         int    `json:"rounds"`
@@ -117,7 +118,14 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 	if !decode(w, r, &req) {
 		return
 	}
-	v, err := s.svc.CreateDebate(agent, req.Question, req.Stance, core.DebateMode(req.Mode), req.Rounds, req.TurnTimeoutSec)
+	v, err := s.svc.CreateDebate(agent, core.CreateDebateParams{
+		Question:       req.Question,
+		Description:    req.Description,
+		Stance:         req.Stance,
+		Mode:           core.DebateMode(req.Mode),
+		Rounds:         req.Rounds,
+		TurnTimeoutSec: req.TurnTimeoutSec,
+	})
 	if err != nil {
 		writeError(w, err)
 		return

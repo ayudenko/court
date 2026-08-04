@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS debates (
 	id            TEXT PRIMARY KEY,
 	question      TEXT NOT NULL,
+	description   TEXT NOT NULL DEFAULT '',
 	mode          TEXT NOT NULL DEFAULT 'moderator',
 	status        TEXT NOT NULL,
 	rounds        INTEGER NOT NULL,
@@ -80,6 +81,7 @@ func Open(path string) (*Store, error) {
 	// Догоняющие миграции для баз, созданных до появления колонок.
 	for _, stmt := range []string{
 		`ALTER TABLE debates ADD COLUMN mode TEXT NOT NULL DEFAULT 'moderator'`,
+		`ALTER TABLE debates ADD COLUMN description TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN support_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN support_name TEXT NOT NULL DEFAULT ''`,
 	} {
@@ -130,10 +132,10 @@ func (s *Store) scanAgent(row *sql.Row) (core.Agent, error) {
 // CreateDebate сохраняет новую дискуссию.
 func (s *Store) CreateDebate(d core.Debate) error {
 	_, err := s.db.Exec(
-		`INSERT INTO debates (id, question, mode, status, rounds, current_round, turn_timeout,
+		`INSERT INTO debates (id, question, description, mode, status, rounds, current_round, turn_timeout,
 		                      creator_id, turn_agent_id, turn_deadline, consensus, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		d.ID, d.Question, d.Mode, d.Status, d.Rounds, d.CurrentRound, d.TurnTimeout,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.Question, d.Description, d.Mode, d.Status, d.Rounds, d.CurrentRound, d.TurnTimeout,
 		d.CreatorID, d.TurnAgentID, nullTime(d.TurnDeadline), boolInt(d.Consensus), d.CreatedAt,
 	)
 	return err
@@ -180,7 +182,7 @@ func (s *Store) ActiveDebates() ([]core.Debate, error) {
 
 func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 	rows, err := s.db.Query(
-		`SELECT id, question, mode, status, rounds, current_round, turn_timeout,
+		`SELECT id, question, description, mode, status, rounds, current_round, turn_timeout,
 		        creator_id, turn_agent_id, turn_deadline, consensus, created_at
 		 FROM debates `+tail, args...)
 	if err != nil {
@@ -192,7 +194,7 @@ func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 		var d core.Debate
 		var deadline sql.NullTime
 		var consensus int
-		if err := rows.Scan(&d.ID, &d.Question, &d.Mode, &d.Status, &d.Rounds, &d.CurrentRound,
+		if err := rows.Scan(&d.ID, &d.Question, &d.Description, &d.Mode, &d.Status, &d.Rounds, &d.CurrentRound,
 			&d.TurnTimeout, &d.CreatorID, &d.TurnAgentID, &deadline, &consensus, &d.CreatedAt); err != nil {
 			return nil, err
 		}
