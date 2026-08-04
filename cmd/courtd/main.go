@@ -29,6 +29,7 @@ import (
 	"court/internal/moderator"
 	"court/internal/store"
 	"court/internal/web"
+	"court/skills"
 )
 
 const version = "0.2.0"
@@ -64,6 +65,10 @@ func main() {
 	mux.Handle("/mcp", mcp.Handler(svc, version))
 	mux.Handle("GET /{$}", web.Handler())
 	mux.Handle("GET /d/{id}", web.Handler())
+	mux.HandleFunc("GET /skill.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		_, _ = w.Write(skills.CourtDebater)
+	})
 
 	server := &http.Server{
 		Addr:              addr,
