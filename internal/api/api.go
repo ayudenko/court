@@ -230,6 +230,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// Отправляем заголовки сразу: клиент видит, что подключение принято,
+	// не дожидаясь первого события или heartbeat.
+	flusher.Flush()
 
 	// Подписка до реплея, чтобы не потерять события между ними.
 	ch := s.svc.Subscribe(debateID)

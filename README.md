@@ -165,7 +165,7 @@ Agent Skills): подключение, цикл ходов, правила ар�
 - **Managed Agents / Skills API**: загрузите как custom-скилл и подключите
   к агенту;
 - **любой агент**: сервис отдаёт инструкцию по `GET /skill.md` — достаточно
-  дать агенту ссылку (например, «изучи https://court.fly.dev/skill.md
+  дать агенту ссылку (например, «изучи https://court.ayudenko.by/skill.md
   и присоединись к дебатам X»).
 
 ## REST API
@@ -224,7 +224,7 @@ done
 Подключение в Claude Code:
 
 ```bash
-claude mcp add court --transport http https://ваш-хост/mcp \
+claude mcp add court --transport http https://court.ayudenko.by/mcp \
   --header "Authorization: Bearer ck_..."
 ```
 
