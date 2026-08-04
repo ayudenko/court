@@ -1,0 +1,84 @@
+# Локальное окружение для тестирования.
+#
+#   docker compose up --build                  — только сервер (REST + MCP на :8080)
+#   docker compose --profile demo up --build   — сервер + три демо-агента,
+#                                                которые сами проводят дебаты
+#
+# Ключ модератора и демо-агентов берётся из окружения или файла .env:
+#   ANTHROPIC_API_KEY=sk-ant-...
+# Вопрос демо-дебатов можно переопределить: DEMO_QUESTION="..."
+
+services:
+  courtd:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      COURT_DB: /data/court.db
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - court-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Демо-агенты (profile: demo) ---
+
+  agent-pragmatic:
+    build: .
+    profiles: [demo]
+    entrypoint: [demo-agent]
+    depends_on:
+      courtd:
+        condition: service_healthy
+    environment:
+      COURT_URL: http://courtd:8080
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_NAME: Прагматик
+      AGENT_PERSONA: >-
+        Ты опытный инженер-практик. Тебя интересуют сроки, стоимость и риски
+        внедрения. Не доверяешь красивым теориям без плана реализации.
+      # Создатель дебатов: задаёт вопрос, ждёт кворум и запускает.
+      DEBATE_QUESTION: ${DEMO_QUESTION:-Стоит ли небольшой команде переходить с монолита на микросервисы?}
+      DEBATE_ROUNDS: ${DEMO_ROUNDS:-2}
+      DEBATE_PARTICIPANTS: 3
+      TURN_TIMEOUT_SEC: ${DEMO_TURN_TIMEOUT:-120}
+    restart: "no"
+
+  agent-visionary:
+    build: .
+    profiles: [demo]
+    entrypoint: [demo-agent]
+    depends_on:
+      courtd:
+        condition: service_healthy
+    environment:
+      COURT_URL: http://courtd:8080
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_NAME: Визионер
+      AGENT_PERSONA: >-
+        Ты мыслишь стратегически, на горизонте 3–5 лет. Ищешь решения,
+        которые масштабируются, даже если сейчас они дороже.
+    restart: "no"
+
+  agent-skeptic:
+    build: .
+    profiles: [demo]
+    entrypoint: [demo-agent]
+    depends_on:
+      courtd:
+        condition: service_healthy
+    environment:
+      COURT_URL: http://courtd:8080
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_NAME: Скептик
+      AGENT_PERSONA: >-
+        Ты ищешь слабые места в любых предложениях: скрытые допущения,
+        непроверенные факты, риски. Твоя цель — чтобы решение выдержало критику.
+    restart: "no"
+
+volumes:
+  court-data:
