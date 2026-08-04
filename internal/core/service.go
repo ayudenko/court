@@ -21,6 +21,7 @@ const (
 	DefaultTimeoutSec = 180
 	DefaultRounds     = 3
 	MaxRounds         = 10
+	MaxPrepTime       = 3600
 )
 
 // Типичные ошибки бизнес-логики (транслируются в HTTP-статусы на уровне API).
@@ -126,6 +127,18 @@ func (s *Service) expireTurns(ctx context.Context) {
 	}
 	now := time.Now()
 	for _, d := range debates {
+		if d.Status == StatusPreparing && !d.TurnDeadline.After(now) {
+			parts, err := s.store.Participants(d.ID)
+			if err != nil || len(parts) == 0 {
+				s.log.Error("окончание подготовки: участники", "debate", d.ID, "err", err)
+				continue
+			}
+			s.log.Info("подготовка завершена, начинаю раунд 1", "debate", d.ID)
+			if err := s.beginFirstRound(&d, parts); err != nil {
+				s.log.Error("окончание подготовки", "debate", d.ID, "err", err)
+			}
+			continue
+		}
 		if d.Status != StatusRunning || d.TurnAgentID == "" || d.TurnDeadline.After(now) {
 			continue
 		}
@@ -195,6 +208,7 @@ type CreateDebateParams struct {
 	Mode           DebateMode // moderator (по умолчанию) | hybrid
 	Rounds         int
 	TurnTimeoutSec int
+	PrepTimeSec    int // фаза подготовки перед раундом 1 (0 — без неё, до 3600)
 }
 
 // CreateDebate создаёт дискуссию в статусе open; создатель сразу участник.
@@ -228,6 +242,9 @@ func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView,
 	if turnTimeoutSec < MinTurnTimeout || turnTimeoutSec > MaxTurnTimeout {
 		return DebateView{}, fmt.Errorf("%w: таймаут хода от %d до %d секунд", ErrValidation, MinTurnTimeout, MaxTurnTimeout)
 	}
+	if p.PrepTimeSec < 0 || p.PrepTimeSec > MaxPrepTime {
+		return DebateView{}, fmt.Errorf("%w: prep_time_sec от 0 до %d секунд", ErrValidation, MaxPrepTime)
+	}
 	d := Debate{
 		ID:          newID("dbt"),
 		Question:    question,
@@ -236,6 +253,7 @@ func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView,
 		Status:      StatusOpen,
 		Rounds:      rounds,
 		TurnTimeout: turnTimeoutSec,
+		PrepTime:    p.PrepTimeSec,
 		CreatorID:   creator.ID,
 		CreatedAt:   time.Now().UTC(),
 	}
@@ -309,17 +327,36 @@ func (s *Service) StartDebate(agent Agent, debateID string) (DebateView, error) 
 	if len(parts) < 2 {
 		return DebateView{}, fmt.Errorf("%w: нужно минимум два участника", ErrBadState)
 	}
+	if d.PrepTime > 0 {
+		// Фаза подготовки: участники изучают материалы, ходов нет.
+		d.Status = StatusPreparing
+		d.TurnAgentID = ""
+		d.TurnDeadline = time.Now().Add(time.Duration(d.PrepTime) * time.Second)
+		if err := s.store.UpdateDebate(d); err != nil {
+			return DebateView{}, err
+		}
+		s.hub.Publish(Event{Type: EventStarted, DebateID: d.ID, Deadline: d.TurnDeadline})
+		return s.view(d)
+	}
+	if err := s.beginFirstRound(&d, parts); err != nil {
+		return DebateView{}, err
+	}
+	return s.view(d)
+}
+
+// beginFirstRound переводит дебаты в раунд 1. Вызывается под локом.
+func (s *Service) beginFirstRound(d *Debate, parts []Participant) error {
 	d.Status = StatusRunning
 	d.CurrentRound = 1
 	d.TurnAgentID = parts[0].AgentID
 	d.TurnDeadline = time.Now().Add(time.Duration(d.TurnTimeout) * time.Second)
-	if err := s.store.UpdateDebate(d); err != nil {
-		return DebateView{}, err
+	if err := s.store.UpdateDebate(*d); err != nil {
+		return err
 	}
 	s.hub.Publish(Event{Type: EventStarted, DebateID: d.ID, Round: 1})
 	s.hub.Publish(Event{Type: EventTurn, DebateID: d.ID, Round: 1,
 		AgentID: parts[0].AgentID, AgentName: parts[0].Name, Deadline: d.TurnDeadline})
-	return s.view(d)
+	return nil
 }
 
 // PostArgument принимает реплику от агента, чья сейчас очередь.
@@ -757,9 +794,10 @@ func (s *Service) TurnStatus(agent Agent, debateID string) (TurnStatus, error) {
 		if a, err := s.store.AgentByID(d.TurnAgentID); err == nil {
 			st.TurnAgent = a.Name
 		}
-		if !d.TurnDeadline.IsZero() {
-			st.DeadlineSec = max(0, int(time.Until(d.TurnDeadline).Seconds()))
-		}
+	}
+	// Дедлайн: в running — конец хода, в preparing — момент старта раунда 1.
+	if !d.TurnDeadline.IsZero() {
+		st.DeadlineSec = max(0, int(time.Until(d.TurnDeadline).Seconds()))
 	}
 	return st, nil
 }
@@ -807,6 +845,10 @@ func (s *Service) view(d Debate) (DebateView, error) {
 			t := d.TurnDeadline
 			v.TurnDeadline = &t
 		}
+	}
+	if d.Status == StatusPreparing && !d.TurnDeadline.IsZero() {
+		t := d.TurnDeadline
+		v.TurnDeadline = &t
 	}
 	if d.Mode == ModeHybrid && d.Status != StatusOpen {
 		if msgs, err := s.store.Messages(d.ID, 0); err == nil {

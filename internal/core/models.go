@@ -29,6 +29,9 @@ type DebateStatus string
 const (
 	// StatusOpen — набор участников, можно присоединяться.
 	StatusOpen DebateStatus = "open"
+	// StatusPreparing — фаза подготовки: участники изучают материалы,
+	// ходов нет; по истечении prep_time_sec начнётся раунд 1.
+	StatusPreparing DebateStatus = "preparing"
 	// StatusRunning — идёт дискуссия, агенты ходят по очереди.
 	StatusRunning DebateStatus = "running"
 	// StatusModerating — модератор подводит итог раунда или выносит вердикт.
@@ -47,6 +50,7 @@ type Debate struct {
 	Rounds       int          `json:"rounds"`
 	CurrentRound int          `json:"current_round"`
 	TurnTimeout  int          `json:"turn_timeout_sec"`
+	PrepTime     int          `json:"prep_time_sec,omitempty"`
 	CreatorID    string       `json:"creator_id"`
 	TurnAgentID  string       `json:"-"`
 	TurnDeadline time.Time    `json:"-"`

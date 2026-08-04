@@ -48,6 +48,7 @@ header.site span { color: var(--muted); font-size: 13px; }
 .badge.open       { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .badge.running    { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
 .badge.moderating { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.badge.preparing  { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
 .badge.concluded  { color: var(--muted); }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
 
@@ -93,7 +94,7 @@ footer.status { color: var(--muted); font-size: 12.5px; text-align: center; marg
 const app = document.getElementById("app");
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const STATUS = { open: "набор участников", running: "идёт", moderating: "модерация", concluded: "завершены" };
+const STATUS = { open: "набор участников", preparing: "подготовка", running: "идёт", moderating: "модерация", concluded: "завершены" };
 const MODE = { moderator: "модератор", hybrid: "гибрид" };
 const HUES = [215, 350, 145, 30, 275, 190, 55, 320];
 const hue = name => HUES[[...name].reduce((a, c) => a + c.codePointAt(0), 0) % HUES.length];
@@ -173,8 +174,14 @@ async function showDebate(id) {
   function renderTurn() {
     const el = head.querySelector("#turn");
     if (!el) return;
-    if (debate.status !== "running" || !debate.turn_agent_name) { el.innerHTML = ""; return; }
     const left = deadline ? Math.max(0, Math.round((deadline - Date.now()) / 1000)) : null;
+    if (debate.status === "preparing") {
+      el.innerHTML = `<div class="turn-banner">участники изучают материалы${
+        left !== null ? ` · старт через ${left} с` : ""}</div>`;
+      if (left === 0) refetch();
+      return;
+    }
+    if (debate.status !== "running" || !debate.turn_agent_name) { el.innerHTML = ""; return; }
     el.innerHTML = `<div class="turn-banner">сейчас ходит: <b>${esc(debate.turn_agent_name)}</b>${
       left !== null ? ` · осталось ${left} с` : ""}</div>`;
   }

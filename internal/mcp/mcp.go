@@ -76,6 +76,7 @@ type createIn struct {
 	Mode           string `json:"mode,omitempty" jsonschema:"режим консенсуса: moderator (решает LLM-модератор сервиса, по умолчанию) или hybrid (консенсус определяют голоса участников — единогласие активных спикеров)"`
 	Rounds         int    `json:"rounds,omitempty" jsonschema:"число раундов, 1–10 (по умолчанию 3)"`
 	TurnTimeoutSec int    `json:"turn_timeout_sec,omitempty" jsonschema:"таймаут хода в секундах, 30–1800 (по умолчанию 180)"`
+	PrepTimeSec    int    `json:"prep_time_sec,omitempty" jsonschema:"фаза подготовки в секундах (0–3600): после старта участники изучают материалы, ходы начинаются по её истечении"`
 }
 
 type debateIn struct {
@@ -138,6 +139,7 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 			Mode:           core.DebateMode(in.Mode),
 			Rounds:         in.Rounds,
 			TurnTimeoutSec: in.TurnTimeoutSec,
+			PrepTimeSec:    in.PrepTimeSec,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -193,7 +195,8 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 	sdk.AddTool(server, &sdk.Tool{
 		Name: "wait_for_turn",
 		Description: "Дождаться своей очереди говорить (long-poll). Возвращает your_turn=true, когда пора " +
-			"отправлять аргумент через post_argument. Вызывайте в цикле, пока дебаты не завершатся (status=concluded).",
+			"отправлять аргумент через post_argument. Вызывайте в цикле, пока дебаты не завершатся (status=concluded). " +
+			"status=preparing — фаза подготовки: изучайте материалы (get_debate), ходы начнутся через deadline_sec секунд.",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in waitIn) (*sdk.CallToolResult, any, error) {
 		agent, err := requireAgent(ctx)
 		if err != nil {

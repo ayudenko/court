@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS debates (
 	rounds        INTEGER NOT NULL,
 	current_round INTEGER NOT NULL DEFAULT 0,
 	turn_timeout  INTEGER NOT NULL,
+	prep_time     INTEGER NOT NULL DEFAULT 0,
 	creator_id    TEXT NOT NULL REFERENCES agents(id),
 	turn_agent_id TEXT NOT NULL DEFAULT '',
 	turn_deadline TIMESTAMP,
@@ -82,6 +83,7 @@ func Open(path string) (*Store, error) {
 	for _, stmt := range []string{
 		`ALTER TABLE debates ADD COLUMN mode TEXT NOT NULL DEFAULT 'moderator'`,
 		`ALTER TABLE debates ADD COLUMN description TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE debates ADD COLUMN prep_time INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE messages ADD COLUMN support_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN support_name TEXT NOT NULL DEFAULT ''`,
 	} {
@@ -133,9 +135,10 @@ func (s *Store) scanAgent(row *sql.Row) (core.Agent, error) {
 func (s *Store) CreateDebate(d core.Debate) error {
 	_, err := s.db.Exec(
 		`INSERT INTO debates (id, question, description, mode, status, rounds, current_round, turn_timeout,
-		                      creator_id, turn_agent_id, turn_deadline, consensus, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                      prep_time, creator_id, turn_agent_id, turn_deadline, consensus, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.ID, d.Question, d.Description, d.Mode, d.Status, d.Rounds, d.CurrentRound, d.TurnTimeout,
+		d.PrepTime,
 		d.CreatorID, d.TurnAgentID, nullTime(d.TurnDeadline), boolInt(d.Consensus), d.CreatedAt,
 	)
 	return err
@@ -174,16 +177,17 @@ func (s *Store) ListDebates(status string, limit int) ([]core.Debate, error) {
 	return s.queryDebates(`ORDER BY created_at DESC LIMIT ?`, limit)
 }
 
-// ActiveDebates возвращает дискуссии в статусах running/moderating —
+// ActiveDebates возвращает дискуссии в статусах preparing/running/moderating —
 // для тикера дедлайнов и восстановления после рестарта.
 func (s *Store) ActiveDebates() ([]core.Debate, error) {
-	return s.queryDebates(`WHERE status IN (?, ?)`, core.StatusRunning, core.StatusModerating)
+	return s.queryDebates(`WHERE status IN (?, ?, ?)`,
+		core.StatusPreparing, core.StatusRunning, core.StatusModerating)
 }
 
 func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 	rows, err := s.db.Query(
 		`SELECT id, question, description, mode, status, rounds, current_round, turn_timeout,
-		        creator_id, turn_agent_id, turn_deadline, consensus, created_at
+		        prep_time, creator_id, turn_agent_id, turn_deadline, consensus, created_at
 		 FROM debates `+tail, args...)
 	if err != nil {
 		return nil, err
@@ -195,7 +199,7 @@ func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 		var deadline sql.NullTime
 		var consensus int
 		if err := rows.Scan(&d.ID, &d.Question, &d.Description, &d.Mode, &d.Status, &d.Rounds, &d.CurrentRound,
-			&d.TurnTimeout, &d.CreatorID, &d.TurnAgentID, &deadline, &consensus, &d.CreatedAt); err != nil {
+			&d.TurnTimeout, &d.PrepTime, &d.CreatorID, &d.TurnAgentID, &deadline, &consensus, &d.CreatedAt); err != nil {
 			return nil, err
 		}
 		d.TurnDeadline = deadline.Time

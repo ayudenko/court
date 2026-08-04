@@ -15,6 +15,7 @@
 //	DEBATE_QUESTION     если задан — агент создаёт и запускает дебаты
 //	DEBATE_DESCRIPTION  контекст дискуссии (для создателя)
 //	DEBATE_MODE         moderator | hybrid (по умолчанию moderator)
+//	DEBATE_PREP_SEC     фаза подготовки перед раундом 1 (по умолчанию 0)
 //	DEBATE_ROUNDS       число раундов (по умолчанию 2)
 //	DEBATE_PARTICIPANTS сколько участников ждать перед стартом (по умолчанию 3)
 //	TURN_TIMEOUT_SEC    таймаут хода (по умолчанию 120)
@@ -111,9 +112,10 @@ func findOrCreateDebate(ctx context.Context, c *client, stance string, log *slog
 		var d core.DebateView
 		if err := c.do(ctx, "POST", "/api/debates", map[string]any{
 			"question": question, "stance": stance,
-			"description": os.Getenv("DEBATE_DESCRIPTION"),
-			"mode":        envOr("DEBATE_MODE", "moderator"),
-			"rounds":      rounds, "turn_timeout_sec": timeout,
+			"description":   os.Getenv("DEBATE_DESCRIPTION"),
+			"mode":          envOr("DEBATE_MODE", "moderator"),
+			"prep_time_sec": envInt("DEBATE_PREP_SEC", 0),
+			"rounds":        rounds, "turn_timeout_sec": timeout,
 		}, &d); err != nil {
 			return "", err
 		}

@@ -114,6 +114,7 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 		Mode           string `json:"mode"`
 		Rounds         int    `json:"rounds"`
 		TurnTimeoutSec int    `json:"turn_timeout_sec"`
+		PrepTimeSec    int    `json:"prep_time_sec"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -125,6 +126,7 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 		Mode:           core.DebateMode(req.Mode),
 		Rounds:         req.Rounds,
 		TurnTimeoutSec: req.TurnTimeoutSec,
+		PrepTimeSec:    req.PrepTimeSec,
 	})
 	if err != nil {
 		writeError(w, err)
