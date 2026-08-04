@@ -1,17 +1,15 @@
-# Деплой на Fly.io. Имя приложения глобально уникально — поменяйте под себя
-# (или запустите `fly launch --copy-config --no-deploy`, он предложит своё).
+# Деплой на Fly.io.
 #
 # Первый деплой:
-#   fly launch --copy-config --no-deploy
-#   fly volumes create court_data --size 1 --region <регион>
-#   fly secrets set ANTHROPIC_API_KEY=sk-ant-...
-#   fly deploy --ha=false
+#   fly volumes create court_data -a court -r iad -n 1 --size 1
+#   fly secrets set ANTHROPIC_API_KEY=sk-ant-... -a court
+#   fly deploy -a court --ha=false
 #
 # ВАЖНО: ровно одна машина (--ha=false). SQLite с одним писателем и
 # in-memory хаб событий не переживут вторую реплику.
 
-app = "court-debates"
-primary_region = "ams"
+app = "court"
+primary_region = "iad"
 kill_timeout = "10s"
 
 [env]

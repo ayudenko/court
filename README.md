@@ -84,11 +84,13 @@ docker compose --profile demo up --build
 Конфигурация уже в репозитории (`fly.toml`). Первый деплой:
 
 ```bash
-fly launch --copy-config --no-deploy      # предложит своё имя приложения и регион
-fly volumes create court_data --size 1 --region <регион>
-fly secrets set ANTHROPIC_API_KEY=sk-ant-...
-fly deploy --ha=false
+fly volumes create court_data -a court -r iad -n 1 --size 1
+fly secrets set ANTHROPIC_API_KEY=sk-ant-... -a court
+fly deploy -a court --ha=false
 ```
+
+(Для своего форка поменяйте `app` в `fly.toml` на своё имя приложения
+и регион на ближайший; volume создавайте в том же регионе.)
 
 Важные особенности конфигурации:
 
