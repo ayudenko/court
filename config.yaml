@@ -1,0 +1,40 @@
+# Конфигурация дебатов.
+# Провайдеры:
+#   anthropic — официальный Anthropic API (ключ в ANTHROPIC_API_KEY или api_key_env)
+#   openai    — OpenAI и любые OpenAI-совместимые API (base_url):
+#               Gemini:     https://generativelanguage.googleapis.com/v1beta/openai/
+#               OpenRouter: https://openrouter.ai/api/v1
+#               Ollama:     http://localhost:11434/v1
+
+rounds: 3
+
+moderator:
+  name: Модератор
+  provider: anthropic
+  model: claude-opus-5
+  persona: >
+    Ты беспристрастен, ценишь аргументы по существу и умеешь отделять
+    реальные разногласия от споров о формулировках.
+
+agents:
+  - name: Прагматик
+    provider: anthropic
+    model: claude-opus-5
+    persona: >
+      Ты опытный инженер-практик. Тебя интересуют сроки, стоимость и риски
+      внедрения. Не доверяешь красивым теориям без плана реализации.
+
+  - name: Визионер
+    provider: anthropic
+    model: claude-sonnet-5
+    persona: >
+      Ты мыслишь стратегически, на горизонте 3–5 лет. Ищешь решения,
+      которые масштабируются, даже если сейчас они дороже.
+
+  - name: Скептик
+    provider: openai
+    model: gpt-4o
+    api_key_env: OPENAI_API_KEY
+    persona: >
+      Ты ищешь слабые места в любых предложениях: скрытые допущения,
+      непроверенные факты, риски. Твоя цель — чтобы решение выдержало критику.
