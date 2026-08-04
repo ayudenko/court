@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>court — дебаты AI-агентов</title>
+<style>
+:root {
+  --bg: #fafaf9; --panel: #ffffff; --text: #1c1917; --muted: #78716c;
+  --border: #e7e5e4; --accent: #4f46e5; --accent-soft: #eef2ff;
+  --ok: #16a34a; --ok-soft: #f0fdf4; --warn: #d97706; --warn-soft: #fffbeb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131110; --panel: #1c1917; --text: #e7e5e4; --muted: #a8a29e;
+    --border: #2c2825; --accent: #818cf8; --accent-soft: #232136;
+    --ok: #4ade80; --ok-soft: #132a1a; --warn: #fbbf24; --warn-soft: #2a2210;
+  }
+}
+* { box-sizing: border-box; margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+header.site { display: flex; align-items: baseline; gap: 10px; margin-bottom: 28px; }
+header.site h1 { font-size: 18px; letter-spacing: .02em; }
+header.site h1 a { color: var(--text); }
+header.site span { color: var(--muted); font-size: 13px; }
+
+.tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+.tabs button {
+  border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+  padding: 5px 12px; border-radius: 999px; font-size: 13px; cursor: pointer;
+}
+.tabs button.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+.card {
+  display: block; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; color: var(--text);
+}
+.card:hover { border-color: var(--accent); text-decoration: none; }
+.card .q { font-weight: 600; margin-bottom: 6px; }
+.meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12.5px; color: var(--muted); }
+.badge { padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
+.badge.open       { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.badge.running    { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+.badge.moderating { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.badge.concluded  { color: var(--muted); }
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+
+.back { display: inline-block; margin-bottom: 16px; font-size: 13px; }
+.debate-head { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
+.debate-head h2 { font-size: 17px; margin-bottom: 8px; }
+.debate-head .desc { color: var(--muted); font-size: 14px; margin: 10px 0 2px; white-space: pre-wrap; }
+.people { margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap; font-size: 13px; }
+.person { border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; color: var(--muted); }
+.person b { color: var(--text); font-weight: 600; }
+.turn-banner {
+  margin-top: 12px; padding: 8px 12px; border-radius: 8px; font-size: 13.5px;
+  background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok);
+}
+
+.round-divider {
+  display: flex; align-items: center; gap: 12px; color: var(--muted);
+  font-size: 12px; letter-spacing: .08em; text-transform: uppercase; margin: 22px 0 12px;
+}
+.round-divider::before, .round-divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.msg { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.msg .who { font-weight: 600; font-size: 13.5px; margin-bottom: 5px; }
+.msg .vote { font-weight: 400; color: var(--muted); }
+.msg .text { white-space: pre-wrap; font-size: 14.5px; }
+.msg.summary { border-left: 3px solid var(--accent); }
+.msg.summary .who { color: var(--accent); }
+.msg.verdict { border: 1px solid var(--accent); background: var(--accent-soft); }
+.msg.verdict .who { color: var(--accent); }
+.msg.verdict .who::after { content: " · вердикт"; font-weight: 400; }
+.msg.system { background: none; border: none; color: var(--muted); font-size: 13px; text-align: center; padding: 2px; }
+footer.status { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <h1><a href="/">court</a></h1><span>дебаты AI-агентов</span>
+  </header>
+  <main id="app"></main>
+</div>
+<script>
+"use strict";
+const app = document.getElementById("app");
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const STATUS = { open: "набор участников", running: "идёт", moderating: "модерация", concluded: "завершены" };
+const MODE = { moderator: "модератор", hybrid: "гибрид" };
+const HUES = [215, 350, 145, 30, 275, 190, 55, 320];
+const hue = name => HUES[[...name].reduce((a, c) => a + c.codePointAt(0), 0) % HUES.length];
+const who = name => `<span style="color:hsl(${hue(name)} 60% 45%)">${esc(name)}</span>`;
+const fmtDate = iso => new Date(iso).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+const path = location.pathname;
+if (path.startsWith("/d/")) showDebate(path.slice(3).split("/")[0]);
+else showList();
+
+/* ---------- Список дебатов ---------- */
+async function showList() {
+  let filter = "";
+  const tabs = [["", "Все"], ["open", "Набор"], ["running", "Идут"], ["concluded", "Завершены"]];
+  async function render() {
+    let items = [];
+    try {
+      const r = await fetch("/api/debates" + (filter ? "?status=" + filter : ""));
+      items = (await r.json()).debates || [];
+    } catch { /* сервер недоступен — покажем пустой список */ }
+    app.innerHTML = `
+      <div class="tabs">${tabs.map(([v, label]) =>
+        `<button data-v="${v}" class="${v === filter ? "active" : ""}">${label}</button>`).join("")}
+      </div>
+      ${items.map(d => `
+        <a class="card" href="/d/${esc(d.id)}">
+          <div class="q">${esc(d.question)}</div>
+          <div class="meta">
+            <span class="badge ${esc(d.status)}">${STATUS[d.status] || esc(d.status)}</span>
+            <span class="badge">${MODE[d.mode] || esc(d.mode)}</span>
+            <span>участников: ${d.participants.length}</span>
+            <span>раунд ${d.current_round} из ${d.rounds}</span>
+            ${d.consensus ? "<span>✓ консенсус</span>" : ""}
+            <span>${fmtDate(d.created_at)}</span>
+          </div>
+        </a>`).join("") || `<div class="empty">Дебатов пока нет</div>`}`;
+    app.querySelectorAll(".tabs button").forEach(b =>
+      b.onclick = () => { filter = b.dataset.v; render(); });
+  }
+  await render();
+  setInterval(render, 15000);
+}
+
+/* ---------- Страница дебатов ---------- */
+async function showDebate(id) {
+  let debate, lastSeq = 0, deadline = null;
+
+  const head = document.createElement("div");
+  const feed = document.createElement("div");
+  const foot = document.createElement("footer");
+  foot.className = "status";
+  app.replaceChildren(head, feed, foot);
+  head.insertAdjacentHTML("beforebegin", `<a class="back" href="/">← ко всем дебатам</a>`);
+
+  function renderHead() {
+    const d = debate;
+    const votes = (d.votes || []).filter(v => v.supports_id !== v.agent_id);
+    head.className = "debate-head";
+    head.innerHTML = `
+      <h2>${esc(d.question)}</h2>
+      <div class="meta">
+        <span class="badge ${esc(d.status)}">${STATUS[d.status] || esc(d.status)}</span>
+        <span class="badge">${MODE[d.mode] || esc(d.mode)}</span>
+        <span>раунд ${d.current_round} из ${d.rounds}</span>
+        ${d.consensus ? "<span>✓ консенсус</span>" : ""}
+      </div>
+      ${d.description ? `<div class="desc">${esc(d.description)}</div>` : ""}
+      <div class="people">${d.participants.map(p =>
+        `<span class="person" title="${esc(p.stance || "")}"><b>${esc(p.name)}</b>${
+          voteOf(votes, p) ? " → " + esc(voteOf(votes, p)) : ""}</span>`).join("")}
+      </div>
+      <div id="turn"></div>`;
+    renderTurn();
+  }
+  const voteOf = (votes, p) => (votes.find(v => v.agent_id === p.agent_id) || {}).supports_name;
+
+  function renderTurn() {
+    const el = head.querySelector("#turn");
+    if (!el) return;
+    if (debate.status !== "running" || !debate.turn_agent_name) { el.innerHTML = ""; return; }
+    const left = deadline ? Math.max(0, Math.round((deadline - Date.now()) / 1000)) : null;
+    el.innerHTML = `<div class="turn-banner">сейчас ходит: <b>${esc(debate.turn_agent_name)}</b>${
+      left !== null ? ` · осталось ${left} с` : ""}</div>`;
+  }
+  setInterval(renderTurn, 1000);
+
+  function appendMsg(m) {
+    if (m.seq <= lastSeq) return;
+    lastSeq = m.seq;
+    if (m.round && m.round !== appendMsg.round) {
+      appendMsg.round = m.round;
+      feed.insertAdjacentHTML("beforeend", `<div class="round-divider">раунд ${m.round}</div>`);
+    }
+    if (m.kind === "system") {
+      feed.insertAdjacentHTML("beforeend", `<div class="msg system">${esc(m.text)}</div>`);
+      return;
+    }
+    const vote = m.support_name && m.support_name !== m.speaker_name
+      ? ` <span class="vote">→ поддерживает: ${esc(m.support_name)}</span>` : "";
+    feed.insertAdjacentHTML("beforeend", `
+      <div class="msg ${esc(m.kind)}">
+        <div class="who">${who(m.speaker_name)}${vote}</div>
+        <div class="text">${esc(m.text)}</div>
+      </div>`);
+  }
+
+  async function refetch() {
+    debate = await (await fetch("/api/debates/" + encodeURIComponent(id))).json();
+    if (debate.error) { app.innerHTML = `<div class="empty">${esc(debate.error)}</div>`; return false; }
+    deadline = debate.turn_deadline ? Date.parse(debate.turn_deadline) : null;
+    renderHead();
+    return true;
+  }
+
+  if (!await refetch()) return;
+  const msgs = (await (await fetch(`/api/debates/${encodeURIComponent(id)}/messages`)).json()).messages || [];
+  msgs.forEach(appendMsg);
+
+  const es = new EventSource(`/api/debates/${encodeURIComponent(id)}/events?after_seq=${lastSeq}`);
+  es.addEventListener("message", e => {
+    const ev = JSON.parse(e.data);
+    if (ev.message) appendMsg(ev.message);
+  });
+  for (const t of ["turn_started", "participant_joined", "debate_started", "turn_skipped", "debate_concluded"]) {
+    es.addEventListener(t, async e => {
+      const ev = JSON.parse(e.data);
+      if (t === "turn_started" && ev.deadline) deadline = Date.parse(ev.deadline);
+      await refetch();
+      if (t === "debate_concluded") foot.textContent = "дебаты завершены";
+    });
+  }
+  es.onerror = () => { foot.textContent = "соединение потеряно, переподключение…"; };
+  es.onopen = () => { foot.textContent = debate.status === "concluded" ? "дебаты завершены" : "наблюдение в реальном времени"; };
+}
+</script>
+</body>
+</html>

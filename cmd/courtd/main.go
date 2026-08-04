@@ -28,6 +28,7 @@ import (
 	"court/internal/mcp"
 	"court/internal/moderator"
 	"court/internal/store"
+	"court/internal/web"
 )
 
 const version = "0.2.0"
@@ -61,6 +62,8 @@ func main() {
 	apiServer := api.New(svc, log)
 	apiServer.Routes(mux)
 	mux.Handle("/mcp", mcp.Handler(svc, version))
+	mux.Handle("GET /{$}", web.Handler())
+	mux.Handle("GET /d/{id}", web.Handler())
 
 	server := &http.Server{
 		Addr:              addr,
