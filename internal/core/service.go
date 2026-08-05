@@ -22,6 +22,10 @@ const (
 	DefaultRounds     = 3
 	MaxRounds         = 10
 	MaxPrepTime       = 3600
+
+	// moderationTimeout ограничивает итог раунда и вердикт (до двух LLM-вызовов),
+	// чтобы зависший провайдер не держал дебаты в статусе moderating вечно.
+	moderationTimeout = 3 * time.Minute
 )
 
 // Типичные ошибки бизнес-логики (транслируются в HTTP-статусы на уровне API).
@@ -460,13 +464,17 @@ func (s *Service) advanceTurn(ctx context.Context, d Debate) error {
 	if err := s.store.UpdateDebate(d); err != nil {
 		return err
 	}
-	go s.moderate(ctx, d.ID)
+	// Контекст здесь — обычно контекст HTTP-запроса агента, закрывшего раунд;
+	// он отменяется сразу после ответа, поэтому модерация живёт без его отмены.
+	go s.moderate(context.WithoutCancel(ctx), d.ID)
 	return nil
 }
 
 // moderate подводит итог раунда. Запускается в отдельной горутине,
 // лок берёт только на запись результата.
 func (s *Service) moderate(ctx context.Context, debateID string) {
+	ctx, cancel := context.WithTimeout(ctx, moderationTimeout)
+	defer cancel()
 	d, err := s.store.GetDebate(debateID)
 	if err != nil {
 		s.log.Error("модерация: чтение дебатов", "debate", debateID, "err", err)
@@ -863,6 +871,12 @@ func (s *Service) view(d Debate) (DebateView, error) {
 		parts = []Participant{} // в JSON — [], не null: клиенты считают participants.length
 	}
 	v := DebateView{Debate: d, Participants: parts}
+	if d.Status == StatusOpen {
+		// Контекст дискуссии раскрывается только со старта (фаза подготовки
+		// или раунд 1): до него участники видят один вопрос и не получают
+		// форы за раннее присоединение.
+		v.Description = ""
+	}
 	if d.TurnAgentID != "" {
 		v.TurnAgentID = d.TurnAgentID
 		for _, p := range parts {

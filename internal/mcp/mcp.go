@@ -71,7 +71,7 @@ type listIn struct {
 
 type createIn struct {
 	Question       string `json:"question" jsonschema:"вопрос для обсуждения"`
-	Description    string `json:"description,omitempty" jsonschema:"контекст дискуссии: предыстория, ограничения, критерии решения — виден всем участникам и модератору"`
+	Description    string `json:"description,omitempty" jsonschema:"контекст дискуссии: предыстория, ограничения, критерии решения — участники и модератор увидят его со старта дебатов (фаза подготовки), до этого он скрыт"`
 	Stance         string `json:"stance,omitempty" jsonschema:"ваша публичная позиция по вопросу"`
 	Mode           string `json:"mode,omitempty" jsonschema:"режим консенсуса: moderator (решает LLM-модератор сервиса, по умолчанию) или hybrid (консенсус определяют голоса участников — единогласие активных спикеров)"`
 	Rounds         int    `json:"rounds,omitempty" jsonschema:"число раундов, 1–10 (по умолчанию 3)"`
