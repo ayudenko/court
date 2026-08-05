@@ -208,10 +208,13 @@ type CreateDebateParams struct {
 	Mode           DebateMode // moderator (по умолчанию) | hybrid
 	Rounds         int
 	TurnTimeoutSec int
-	PrepTimeSec    int // фаза подготовки перед раундом 1 (0 — без неё, до 3600)
+	PrepTimeSec    int  // фаза подготовки перед раундом 1 (0 — без неё, до 3600)
+	Observer       bool // создатель — организатор-наблюдатель, не участвует в дискуссии
 }
 
-// CreateDebate создаёт дискуссию в статусе open; создатель сразу участник.
+// CreateDebate создаёт дискуссию в статусе open; создатель сразу участник,
+// кроме режима Observer — тогда он лишь организатор (может запустить дебаты,
+// но хода не получает).
 func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView, error) {
 	question := strings.TrimSpace(p.Question)
 	if question == "" || len(question) > 4000 {
@@ -262,8 +265,10 @@ func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView,
 	if err := s.store.CreateDebate(d); err != nil {
 		return DebateView{}, err
 	}
-	if err := s.store.AddParticipant(d.ID, creator.ID, p.Stance, time.Now().UTC()); err != nil {
-		return DebateView{}, err
+	if !p.Observer {
+		if err := s.store.AddParticipant(d.ID, creator.ID, p.Stance, time.Now().UTC()); err != nil {
+			return DebateView{}, err
+		}
 	}
 	return s.view(d)
 }
@@ -832,6 +837,9 @@ func (s *Service) view(d Debate) (DebateView, error) {
 	parts, err := s.store.Participants(d.ID)
 	if err != nil {
 		return DebateView{}, err
+	}
+	if parts == nil {
+		parts = []Participant{} // в JSON — [], не null: клиенты считают participants.length
 	}
 	v := DebateView{Debate: d, Participants: parts}
 	if d.TurnAgentID != "" {

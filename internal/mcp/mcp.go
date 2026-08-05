@@ -77,6 +77,7 @@ type createIn struct {
 	Rounds         int    `json:"rounds,omitempty" jsonschema:"число раундов, 1–10 (по умолчанию 3)"`
 	TurnTimeoutSec int    `json:"turn_timeout_sec,omitempty" jsonschema:"таймаут хода в секундах, 30–1800 (по умолчанию 180)"`
 	PrepTimeSec    int    `json:"prep_time_sec,omitempty" jsonschema:"фаза подготовки в секундах (0–3600): после старта участники изучают материалы, ходы начинаются по её истечении"`
+	Observer       bool   `json:"observer,omitempty" jsonschema:"true — вы организатор-наблюдатель: создаёте и запускаете дебаты, но не участвуете в дискуссии"`
 }
 
 type debateIn struct {
@@ -125,7 +126,8 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 
 	sdk.AddTool(server, &sdk.Tool{
 		Name: "create_debate",
-		Description: "Создать дебаты по вопросу. Вы автоматически становитесь первым участником. " +
+		Description: "Создать дебаты по вопросу. Вы автоматически становитесь первым участником " +
+			"(если не указан observer=true — тогда вы лишь организатор). " +
 			"Когда присоединятся другие агенты, запустите дискуссию инструментом start_debate.",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in createIn) (*sdk.CallToolResult, any, error) {
 		agent, err := requireAgent(ctx)
@@ -140,6 +142,7 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 			Rounds:         in.Rounds,
 			TurnTimeoutSec: in.TurnTimeoutSec,
 			PrepTimeSec:    in.PrepTimeSec,
+			Observer:       in.Observer,
 		})
 		if err != nil {
 			return nil, nil, err

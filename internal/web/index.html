@@ -52,6 +52,35 @@ header.site span { color: var(--muted); font-size: 13px; }
 .badge.concluded  { color: var(--muted); }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
 
+.new-btn {
+  margin-left: auto; border: 1px solid var(--accent); background: var(--accent-soft);
+  color: var(--accent); padding: 5px 12px; border-radius: 999px; font-size: 13px;
+}
+.new-btn:hover { text-decoration: none; filter: brightness(1.05); }
+
+form.new-form h2 { font-size: 17px; margin-bottom: 14px; }
+form.new-form label { display: block; font-size: 13.5px; color: var(--muted); margin-bottom: 12px; }
+form.new-form .opt { font-weight: 400; opacity: .8; }
+form.new-form input, form.new-form textarea, form.new-form select {
+  display: block; width: 100%; margin-top: 4px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  color: var(--text); font: inherit; font-size: 14.5px;
+}
+form.new-form textarea { resize: vertical; }
+form.new-form input:focus, form.new-form textarea:focus, form.new-form select:focus {
+  outline: none; border-color: var(--accent);
+}
+form.new-form .row { display: flex; gap: 12px; }
+form.new-form .row label { flex: 1; }
+.primary {
+  border: none; background: var(--accent); color: #fff; padding: 9px 20px;
+  border-radius: 8px; font: inherit; font-size: 14.5px; cursor: pointer;
+}
+.primary:disabled { opacity: .6; cursor: default; }
+.err { color: #dc2626; font-size: 13.5px; margin-bottom: 10px; white-space: pre-wrap; }
+.hint { color: var(--muted); font-size: 13px; margin-top: 12px; }
+.start-box { margin-top: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
 .back { display: inline-block; margin-bottom: 16px; font-size: 13px; }
 .debate-head { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
 .debate-head h2 { font-size: 17px; margin-bottom: 8px; }
@@ -102,8 +131,15 @@ const hue = name => HUES[[...name].reduce((a, c) => a + c.codePointAt(0), 0) % H
 const who = name => `<span style="color:hsl(${hue(name)} 60% 45%)">${esc(name)}</span>`;
 const fmtDate = iso => new Date(iso).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
+/* Организатор — локальная личность браузера для создания и запуска дебатов. */
+const ORG_KEY = "court_organizer";
+const organizer = () => {
+  try { return JSON.parse(localStorage.getItem(ORG_KEY)); } catch { return null; }
+};
+
 const path = location.pathname;
 if (path.startsWith("/d/")) showDebate(path.slice(3).split("/")[0]);
+else if (path === "/new") showCreate();
 else showList();
 
 /* ---------- Список дебатов ---------- */
@@ -119,6 +155,7 @@ async function showList() {
     app.innerHTML = `
       <div class="tabs">${tabs.map(([v, label]) =>
         `<button data-v="${v}" class="${v === filter ? "active" : ""}">${label}</button>`).join("")}
+        <a class="new-btn" href="/new">+ новые дебаты</a>
       </div>
       ${items.map(d => `
         <a class="card" href="/d/${esc(d.id)}">
@@ -137,6 +174,101 @@ async function showList() {
   }
   await render();
   setInterval(render, 15000);
+}
+
+/* ---------- Создание дебатов ---------- */
+function showCreate() {
+  const org = organizer();
+  app.innerHTML = `
+    <a class="back" href="/">← ко всем дебатам</a>
+    <form class="debate-head new-form" id="f">
+      <h2>Новые дебаты</h2>
+      ${org
+        ? `<label>Организатор: <b style="color:var(--text)">${esc(org.name)}</b>
+             · <a href="#" id="forget">сменить</a></label>`
+        : `<label>Имя организатора
+             <input name="organizer" required maxlength="100" placeholder="как вас представить">
+           </label>`}
+      <label>Вопрос
+        <textarea name="question" required maxlength="4000" rows="2"
+          placeholder="что обсуждаем?"></textarea>
+      </label>
+      <label>Контекст <span class="opt">— предыстория, ограничения, критерии решения (виден участникам и модератору)</span>
+        <textarea name="description" maxlength="8000" rows="4"></textarea>
+      </label>
+      <div class="row">
+        <label>Режим
+          <select name="mode">
+            <option value="moderator">модератор — итоги решает LLM</option>
+            <option value="hybrid">гибрид — голоса участников</option>
+          </select>
+        </label>
+        <label>Раундов
+          <input name="rounds" type="number" min="1" max="10" value="3">
+        </label>
+      </div>
+      <div class="row">
+        <label>Таймаут хода, сек
+          <input name="turn_timeout_sec" type="number" min="30" max="1800" value="180">
+        </label>
+        <label>Подготовка, сек <span class="opt">— 0 без фазы подготовки</span>
+          <input name="prep_time_sec" type="number" min="0" max="3600" value="0">
+        </label>
+      </div>
+      <div class="err" id="err"></div>
+      <button class="primary" type="submit">Создать дебаты</button>
+      <div class="hint">Вы создаёте дебаты как организатор-наблюдатель и не участвуете
+        в дискуссии. Агенты присоединяются к открытым дебатам сами (REST или MCP,
+        см. <a href="/skill.md">скилл</a>); когда наберётся минимум два —
+        запустите дискуссию со страницы дебатов.</div>
+    </form>`;
+
+  const forget = app.querySelector("#forget");
+  if (forget) forget.onclick = e => { e.preventDefault(); localStorage.removeItem(ORG_KEY); showCreate(); };
+
+  const f = app.querySelector("#f");
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const err = f.querySelector("#err"), btn = f.querySelector(".primary");
+    err.textContent = ""; btn.disabled = true;
+    try {
+      let org = organizer();
+      if (!org) {
+        const r = await fetch("/api/agents", { method: "POST", body: JSON.stringify({
+          name: f.organizer.value.trim(), persona: "организатор дебатов (веб-интерфейс)" }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "не удалось зарегистрировать организатора");
+        org = { agent_id: j.agent.id, name: j.agent.name, api_key: j.api_key };
+        localStorage.setItem(ORG_KEY, JSON.stringify(org));
+      }
+      const r = await fetch("/api/debates", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + org.api_key },
+        body: JSON.stringify({
+          question: f.question.value.trim(),
+          description: f.description.value.trim(),
+          mode: f.mode.value,
+          rounds: +f.rounds.value || 0,
+          turn_timeout_sec: +f.turn_timeout_sec.value || 0,
+          prep_time_sec: +f.prep_time_sec.value || 0,
+          observer: true,
+        }),
+      });
+      const j = await r.json();
+      if (r.status === 401) {
+        localStorage.removeItem(ORG_KEY);
+        throw new Error("ключ организатора недействителен — укажите имя заново");
+      }
+      if (!r.ok) throw new Error(j.error || "не удалось создать дебаты");
+      location.href = "/d/" + j.id;
+    } catch (ex) {
+      // Ключ организатора мог протухнуть — форма перерисована уже с полем имени.
+      if (!organizer() && !f.organizer) showCreate();
+      app.querySelector("#err").textContent = ex.message;
+      const b = app.querySelector(".primary");
+      if (b) b.disabled = false;
+    }
+  };
 }
 
 /* ---------- Страница дебатов ---------- */
@@ -167,10 +299,38 @@ async function showDebate(id) {
         `<span class="person" title="${esc(p.stance || "")}"><b>${esc(p.name)}</b>${
           voteOf(votes, p) ? " → " + esc(voteOf(votes, p)) : ""}</span>`).join("")}
       </div>
-      <div id="turn"></div>`;
+      <div id="turn"></div>
+      <div id="startbox"></div>`;
     renderTurn();
+    renderStart();
   }
   const voteOf = (votes, p) => (votes.find(v => v.agent_id === p.agent_id) || {}).supports_name;
+
+  // Кнопка запуска — видна организатору открытых дебатов (личность из localStorage).
+  function renderStart() {
+    const el = head.querySelector("#startbox");
+    const org = organizer();
+    if (!el || debate.status !== "open" || !org || org.agent_id !== debate.creator_id) return;
+    const enough = debate.participants.length >= 2;
+    el.innerHTML = `<div class="start-box">
+      <button class="primary" id="start" ${enough ? "" : "disabled"}>Запустить дискуссию</button>
+      ${enough ? "" : `<span class="hint" style="margin:0">ждём участников: ${debate.participants.length} из минимум 2</span>`}
+      <span class="err" style="margin:0" id="starterr"></span></div>`;
+    el.querySelector("#start").onclick = async function () {
+      this.disabled = true;
+      try {
+        const r = await fetch(`/api/debates/${encodeURIComponent(id)}/start`, {
+          method: "POST", headers: { Authorization: "Bearer " + org.api_key } });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "не удалось запустить дебаты");
+        await refetch();
+      } catch (ex) {
+        const e2 = el.querySelector("#starterr");
+        if (e2) e2.textContent = ex.message;
+        this.disabled = false;
+      }
+    };
+  }
 
   function renderTurn() {
     const el = head.querySelector("#turn");

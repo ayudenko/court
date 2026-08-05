@@ -64,6 +64,7 @@ func main() {
 	apiServer.Routes(mux)
 	mux.Handle("/mcp", mcp.Handler(svc, version))
 	mux.Handle("GET /{$}", web.Handler())
+	mux.Handle("GET /new", web.Handler())
 	mux.Handle("GET /d/{id}", web.Handler())
 	mux.HandleFunc("GET /skill.md", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
