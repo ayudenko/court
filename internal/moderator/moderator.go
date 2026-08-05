@@ -9,7 +9,10 @@ import (
 	"court/internal/llm"
 )
 
-const consensusMarker = "КОНСЕНСУС: ДА"
+const (
+	consensusMarker     = "КОНСЕНСУС: ДА"
+	openQuestionsHeader = "ОТКРЫТЫЕ ВОПРОСЫ"
+)
 
 // Moderator подводит итоги раундов и выносит вердикт через LLM.
 type Moderator struct {
@@ -47,8 +50,8 @@ func (m *Moderator) CheckRound(ctx context.Context, question, transcript string,
 
 Завершился раунд %d. Сделай следующее:
 1. Кратко (3–5 предложений) подведи итог раунда: по каким пунктам участники сходятся, по каким спорят.
-2. Реши, достигнут ли содержательный консенсус — участники сошлись в главном и новые раунды ничего не добавят.
-3. Последней строкой ответа напиши ровно одно из двух: "КОНСЕНСУС: ДА" или "КОНСЕНСУС: НЕТ".`,
+2. Перечисли открытые вопросы — предметные разногласия, по которым участники ещё не сошлись. Сюда входят и «детали, которые можно уточнить позже»: пока участники не согласовали их явно, вопрос открыт. Раздел начни строкой "ОТКРЫТЫЕ ВОПРОСЫ:", пункты дай нумерованным списком. Если открытых вопросов не осталось, напиши ровно "ОТКРЫТЫЕ ВОПРОСЫ: НЕТ".
+3. Последней строкой ответа напиши ровно одно из двух: "КОНСЕНСУС: ДА" или "КОНСЕНСУС: НЕТ". Консенсус возможен только при пустом списке открытых вопросов.`,
 		question, transcript, round,
 	)
 	text, err := m.provider.Stream(ctx,
@@ -57,7 +60,28 @@ func (m *Moderator) CheckRound(ctx context.Context, question, transcript string,
 	if err != nil {
 		return false, "", err
 	}
-	return strings.Contains(strings.ToUpper(text), consensusMarker), text, nil
+	consensus := strings.Contains(strings.ToUpper(text), consensusMarker) && openQuestionsEmpty(text)
+	return consensus, text, nil
+}
+
+// openQuestionsEmpty сообщает, пуст ли раздел "ОТКРЫТЫЕ ВОПРОСЫ" в ответе
+// модератора. Консенсус засчитывается только при явном "ОТКРЫТЫЕ ВОПРОСЫ: НЕТ":
+// раздел с пунктами или без раздела вовсе — вопросы считаются оставшимися,
+// даже если модель написала "КОНСЕНСУС: ДА".
+func openQuestionsEmpty(text string) bool {
+	up := strings.ToUpper(text)
+	idx := strings.Index(up, openQuestionsHeader)
+	if idx < 0 {
+		return false
+	}
+	for _, line := range strings.Split(up[idx+len(openQuestionsHeader):], "\n") {
+		line = strings.Trim(line, " \t:*#._-")
+		if line == "" {
+			continue
+		}
+		return strings.HasPrefix(line, "НЕТ")
+	}
+	return false
 }
 
 // Summary подводит итог раунда без решения о консенсусе (режим hybrid,
