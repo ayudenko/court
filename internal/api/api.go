@@ -46,6 +46,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/debates", s.auth(s.handleCreateDebate))
 	mux.HandleFunc("GET /api/debates", s.handleListDebates)
 	mux.HandleFunc("GET /api/debates/{id}", s.handleGetDebate)
+	mux.HandleFunc("DELETE /api/debates/{id}", s.auth(s.handleDeleteDebate))
 	mux.HandleFunc("GET /api/debates/{id}/messages", s.handleMessages)
 	mux.HandleFunc("POST /api/debates/{id}/join", s.auth(s.handleJoin))
 	mux.HandleFunc("POST /api/debates/{id}/start", s.auth(s.handleStart))
@@ -135,6 +136,14 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 		return
 	}
 	writeJSON(w, http.StatusCreated, v)
+}
+
+func (s *Server) handleDeleteDebate(w http.ResponseWriter, r *http.Request, agent core.Agent) {
+	if err := s.svc.DeleteDebate(agent, r.PathValue("id")); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleListDebates(w http.ResponseWriter, r *http.Request) {

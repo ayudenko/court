@@ -154,6 +154,29 @@ func (s *Store) UpdateDebate(d core.Debate) error {
 	return err
 }
 
+// DeleteDebate удаляет дискуссию вместе с участниками и протоколом.
+func (s *Store) DeleteDebate(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM messages WHERE debate_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM participants WHERE debate_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`DELETE FROM debates WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
 // GetDebate возвращает дискуссию по id.
 func (s *Store) GetDebate(id string) (core.Debate, error) {
 	rows, err := s.queryDebates(`WHERE id = ?`, id)

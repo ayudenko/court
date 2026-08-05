@@ -105,6 +105,7 @@ const (
 	EventMessage   = "message"
 	EventSkipped   = "turn_skipped"
 	EventConcluded = "debate_concluded"
+	EventDeleted   = "debate_deleted"
 )
 
 // Event — событие в дебатах для подписчиков.

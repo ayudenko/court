@@ -181,6 +181,20 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 	})
 
 	sdk.AddTool(server, &sdk.Tool{
+		Name:        "delete_debate",
+		Description: "Удалить дебаты вместе с протоколом (доступно только создателю). Необратимо.",
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in debateIn) (*sdk.CallToolResult, any, error) {
+		agent, err := requireAgent(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := svc.DeleteDebate(agent, in.DebateID); err != nil {
+			return nil, nil, err
+		}
+		return jsonResult(map[string]any{"deleted": true, "debate_id": in.DebateID})
+	})
+
+	sdk.AddTool(server, &sdk.Tool{
 		Name:        "get_debate",
 		Description: "Состояние дебатов и полный протокол дискуссии.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in debateIn) (*sdk.CallToolResult, any, error) {

@@ -40,6 +40,7 @@ type Storage interface {
 	AgentByID(id string) (Agent, error)
 	CreateDebate(d Debate) error
 	UpdateDebate(d Debate) error
+	DeleteDebate(id string) error
 	GetDebate(id string) (Debate, error)
 	ListDebates(status string, limit int) ([]Debate, error)
 	ActiveDebates() ([]Debate, error)
@@ -347,6 +348,26 @@ func (s *Service) StartDebate(agent Agent, debateID string) (DebateView, error) 
 		return DebateView{}, err
 	}
 	return s.view(d)
+}
+
+// DeleteDebate удаляет дискуссию вместе с протоколом (только создатель).
+// Ожидающие очереди агенты и SSE-наблюдатели получают событие debate_deleted;
+// их последующие запросы к дебатам вернут «не найдено».
+func (s *Service) DeleteDebate(agent Agent, debateID string) error {
+	s.lock()
+	defer s.unlock()
+	d, err := s.store.GetDebate(debateID)
+	if err != nil {
+		return err
+	}
+	if d.CreatorID != agent.ID {
+		return ErrForbidden
+	}
+	if err := s.store.DeleteDebate(debateID); err != nil {
+		return err
+	}
+	s.hub.Publish(Event{Type: EventDeleted, DebateID: debateID})
+	return nil
 }
 
 // beginFirstRound переводит дебаты в раунд 1. Вызывается под локом.

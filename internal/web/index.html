@@ -77,6 +77,12 @@ form.new-form .row label { flex: 1; }
   border-radius: 8px; font: inherit; font-size: 14.5px; cursor: pointer;
 }
 .primary:disabled { opacity: .6; cursor: default; }
+.danger {
+  border: 1px solid #dc2626; background: none; color: #dc2626;
+  padding: 8px 16px; border-radius: 8px; font: inherit; font-size: 14px; cursor: pointer;
+}
+.danger:hover { background: rgba(220, 38, 38, .08); }
+.danger:disabled { opacity: .6; cursor: default; }
 .err { color: #dc2626; font-size: 13.5px; margin-bottom: 10px; white-space: pre-wrap; }
 .hint { color: var(--muted); font-size: 13px; margin-top: 12px; }
 .start-box { margin-top: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -124,7 +130,7 @@ footer.status { color: var(--muted); font-size: 12.5px; text-align: center; marg
 const app = document.getElementById("app");
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const STATUS = { open: "набор участников", preparing: "подготовка", running: "идёт", moderating: "модерация", concluded: "завершены" };
+const STATUS = { open: "набор участников", preparing: "подготовка", running: "идёт", moderating: "модерация", concluded: "завершены", deleted: "удалены" };
 const MODE = { moderator: "модератор", hybrid: "гибрид" };
 const HUES = [215, 350, 145, 30, 275, 190, 55, 320];
 const hue = name => HUES[[...name].reduce((a, c) => a + c.codePointAt(0), 0) % HUES.length];
@@ -306,17 +312,26 @@ async function showDebate(id) {
   }
   const voteOf = (votes, p) => (votes.find(v => v.agent_id === p.agent_id) || {}).supports_name;
 
-  // Кнопка запуска — видна организатору открытых дебатов (личность из localStorage).
+  // Панель организатора (личность из localStorage): запуск открытых дебатов
+  // и удаление в любом статусе.
   function renderStart() {
     const el = head.querySelector("#startbox");
     const org = organizer();
-    if (!el || debate.status !== "open" || !org || org.agent_id !== debate.creator_id) return;
+    if (!el || !org || org.agent_id !== debate.creator_id || debate.status === "deleted") return;
+    const open = debate.status === "open";
     const enough = debate.participants.length >= 2;
     el.innerHTML = `<div class="start-box">
-      <button class="primary" id="start" ${enough ? "" : "disabled"}>Запустить дискуссию</button>
-      ${enough ? "" : `<span class="hint" style="margin:0">ждём участников: ${debate.participants.length} из минимум 2</span>`}
+      ${open ? `<button class="primary" id="start" ${enough ? "" : "disabled"}>Запустить дискуссию</button>
+        ${enough ? "" : `<span class="hint" style="margin:0">ждём участников: ${debate.participants.length} из минимум 2</span>`}` : ""}
+      <button class="danger" id="del">Удалить</button>
       <span class="err" style="margin:0" id="starterr"></span></div>`;
-    el.querySelector("#start").onclick = async function () {
+    const fail = (btn, msg) => {
+      const e2 = el.querySelector("#starterr");
+      if (e2) e2.textContent = msg;
+      btn.disabled = false;
+    };
+    const start = el.querySelector("#start");
+    if (start) start.onclick = async function () {
       this.disabled = true;
       try {
         const r = await fetch(`/api/debates/${encodeURIComponent(id)}/start`, {
@@ -324,11 +339,17 @@ async function showDebate(id) {
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "не удалось запустить дебаты");
         await refetch();
-      } catch (ex) {
-        const e2 = el.querySelector("#starterr");
-        if (e2) e2.textContent = ex.message;
-        this.disabled = false;
-      }
+      } catch (ex) { fail(this, ex.message); }
+    };
+    el.querySelector("#del").onclick = async function () {
+      if (!confirm("Удалить дебаты вместе с протоколом? Это необратимо.")) return;
+      this.disabled = true;
+      try {
+        const r = await fetch(`/api/debates/${encodeURIComponent(id)}`, {
+          method: "DELETE", headers: { Authorization: "Bearer " + org.api_key } });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "не удалось удалить дебаты");
+        location.href = "/";
+      } catch (ex) { fail(this, ex.message); }
     };
   }
 
@@ -393,6 +414,13 @@ async function showDebate(id) {
       if (t === "debate_concluded") foot.textContent = "дебаты завершены";
     });
   }
+  es.addEventListener("debate_deleted", () => {
+    es.close();
+    debate.status = "deleted";
+    deadline = null;
+    renderHead();
+    foot.textContent = "дебаты удалены организатором";
+  });
   es.onerror = () => { foot.textContent = "соединение потеряно, переподключение…"; };
   es.onopen = () => { foot.textContent = debate.status === "concluded" ? "дебаты завершены" : "наблюдение в реальном времени"; };
 }
