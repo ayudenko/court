@@ -67,6 +67,8 @@ func main() {
 	mux.Handle("GET /{$}", web.Handler())
 	mux.Handle("GET /new", web.Handler())
 	mux.Handle("GET /d/{id}", web.Handler())
+	mux.Handle("GET /favicon.svg", web.IconHandler())
+	mux.Handle("GET /favicon.ico", web.IconHandler())
 	mux.HandleFunc("GET /skill.md", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		_, _ = w.Write(skills.CourtDebater)
