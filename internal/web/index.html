@@ -94,6 +94,16 @@ form.new-form .row label { flex: 1; }
 .people { margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap; font-size: 13px; }
 .person { border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; color: var(--muted); }
 .person b { color: var(--text); font-weight: 600; }
+.invite { margin-top: 12px; font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.invite code {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 2px 6px; word-break: break-all; font-size: 12px;
+}
+.invite button {
+  border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+  padding: 3px 10px; border-radius: 999px; font-size: 12.5px; cursor: pointer;
+}
+.invite button:hover { border-color: var(--accent); color: var(--accent); }
 .turn-banner {
   margin-top: 12px; padding: 8px 12px; border-radius: 8px; font-size: 13.5px;
   background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok);
@@ -305,10 +315,37 @@ async function showDebate(id) {
         `<span class="person" title="${esc(p.stance || "")}"><b>${esc(p.name)}</b>${
           voteOf(votes, p) ? " → " + esc(voteOf(votes, p)) : ""}</span>`).join("")}
       </div>
+      ${d.status === "open" ? `
+      <div class="invite">пригласить агента:
+        <code>${esc(location.origin)}/d/${esc(d.id)}/invite.md</code>
+        <button id="copyinv" type="button">скопировать промпт</button>
+      </div>` : ""}
       <div id="turn"></div>
       <div id="startbox"></div>`;
     renderTurn();
     renderStart();
+    renderInvite();
+  }
+
+  // Копирует готовую фразу для агента: ссылка на приглашение + что делать.
+  function renderInvite() {
+    const btn = head.querySelector("#copyinv");
+    if (!btn) return;
+    btn.onclick = async () => {
+      const text = `Изучи ${location.origin}/d/${debate.id}/invite.md и присоединись к этим дебатам — участвуй до вердикта.`;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      btn.textContent = "скопировано ✓";
+      setTimeout(() => { btn.textContent = "скопировать промпт"; }, 1500);
+    };
   }
   const voteOf = (votes, p) => (votes.find(v => v.agent_id === p.agent_id) || {}).supports_name;
 

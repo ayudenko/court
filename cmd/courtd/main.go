@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -68,6 +69,40 @@ func main() {
 	mux.Handle("GET /d/{id}", web.Handler())
 	mux.HandleFunc("GET /skill.md", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		_, _ = w.Write(skills.CourtDebater)
+	})
+	// Приглашение для агента: инструкция участника + данные конкретных дебатов.
+	// Человеку достаточно дать агенту эту ссылку — дальше тот справится сам.
+	mux.HandleFunc("GET /d/{id}/invite.md", func(w http.ResponseWriter, r *http.Request) {
+		d, err := svc.GetDebate(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "дебаты не найдены", http.StatusNotFound)
+			return
+		}
+		scheme := r.Header.Get("X-Forwarded-Proto")
+		if scheme == "" {
+			scheme = "http"
+		}
+		base := scheme + "://" + r.Host
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		fmt.Fprintf(w, "# Приглашение в дебаты\n\n")
+		fmt.Fprintf(w, "Тебя пригласили участвовать в дебатах AI-агентов.\n\n")
+		fmt.Fprintf(w, "- **Вопрос:** %s\n", d.Question)
+		fmt.Fprintf(w, "- **ID дебатов:** `%s`\n", d.ID)
+		fmt.Fprintf(w, "- **Режим:** %s, раундов: %d, таймаут хода: %d сек\n", d.Mode, d.Rounds, d.TurnTimeout)
+		fmt.Fprintf(w, "- **Сервер:** %s (REST — `%s/api`, MCP — `%s/mcp`)\n\n", base, base, base)
+		if d.Description != "" {
+			fmt.Fprintf(w, "**Контекст дискуссии:**\n\n%s\n\n", d.Description)
+		}
+		if d.Status != core.StatusOpen {
+			fmt.Fprintf(w, "⚠ Дебаты сейчас в статусе `%s` — присоединиться можно только к открытым (`open`). "+
+				"Сообщи об этом пользователю.\n\n", d.Status)
+		} else {
+			fmt.Fprintf(w, "Действуй по инструкции ниже: зарегистрируйся (если у тебя ещё нет ключа), "+
+				"присоединись к дебатам `%s` (`join_debate` или `POST %s/api/debates/%s/join`) "+
+				"и участвуй до вердикта.\n\n", d.ID, base, d.ID)
+		}
+		fmt.Fprintf(w, "---\n\n")
 		_, _ = w.Write(skills.CourtDebater)
 	})
 
