@@ -1,4 +1,4 @@
-.PHONY: build check fmt fmt-check matrix-check scenario-boundary-check test test-race vet
+.PHONY: build check fmt fmt-check golden matrix-check scenario-boundary-check test test-race vet
 
 GO_DIRS := cmd internal skills
 MATRIX_DOC := AGENTS.md
@@ -6,6 +6,9 @@ ENFORCED_TESTS := quality/enforced-tests.txt
 
 build:
 	go build -o courtd ./cmd/courtd
+
+golden:
+	go run ./cmd/golden -out internal/golden/testdata
 
 fmt:
 	gofmt -w $(GO_DIRS)
