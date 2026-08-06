@@ -69,9 +69,12 @@ The mode is chosen at creation time (`mode`):
 server-side LLM moderator: after every round it writes a summary, lists the
 open questions (substantive disagreements) and judges whether the participants
 have converged; at the end it writes the verdict. Early termination on
-consensus is only possible when the list of open questions is empty
-(`ОТКРЫТЫЕ ВОПРОСЫ: НЕТ`) — as long as a single item remains in the round
-summary, the discussion continues. Requires an LLM key on the service.
+consensus is only possible when the structured `unresolved_questions` list is
+empty — as long as a single item remains, the discussion continues. Summaries
+and verdicts are returned through forced tool calls with typed `claims`
+(citing transcript message `seq` values), `decisions`, `unresolved_questions`,
+and `consensus` fields; no language-specific text markers are parsed. Requires
+an LLM key on the service and a model/API with function-tool calling support.
 
 **`hybrid`** — consensus is decided by the participants themselves, by voting.
 Every argument may carry a `support_agent_id` vote — "whose position I back

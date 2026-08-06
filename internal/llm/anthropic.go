@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -67,4 +68,48 @@ func (p *AnthropicProvider) Stream(ctx context.Context, system string, msgs []Me
 		return sb.String(), fmt.Errorf("anthropic stream: %w", err)
 	}
 	return sb.String(), nil
+}
+
+// CallTool заставляет Claude вернуть типизированный результат через tool use.
+func (p *AnthropicProvider) CallTool(ctx context.Context, system string, msgs []Message, tool Tool) (json.RawMessage, error) {
+	params := anthropic.MessageNewParams{
+		Model:     anthropic.Model(p.model),
+		MaxTokens: p.maxTokens,
+	}
+	if system != "" {
+		params.System = []anthropic.TextBlockParam{{Text: system}}
+	}
+	for _, m := range msgs {
+		block := anthropic.NewTextBlock(m.Content)
+		switch m.Role {
+		case RoleAssistant:
+			params.Messages = append(params.Messages, anthropic.NewAssistantMessage(block))
+		default:
+			params.Messages = append(params.Messages, anthropic.NewUserMessage(block))
+		}
+	}
+
+	inputSchema := anthropic.ToolInputSchemaParam{
+		Properties: tool.Properties,
+		Required:   tool.Required,
+		ExtraFields: map[string]any{
+			"additionalProperties": false,
+		},
+	}
+	toolParam := anthropic.ToolUnionParamOfTool(inputSchema, tool.Name)
+	toolParam.OfTool.Description = anthropic.String(tool.Description)
+	toolParam.OfTool.Strict = anthropic.Bool(true)
+	params.Tools = []anthropic.ToolUnionParam{toolParam}
+	params.ToolChoice = anthropic.ToolChoiceParamOfTool(tool.Name)
+
+	message, err := p.client.Messages.New(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic tool call: %w", err)
+	}
+	for _, block := range message.Content {
+		if call, ok := block.AsAny().(anthropic.ToolUseBlock); ok && call.Name == tool.Name {
+			return call.Input, nil
+		}
+	}
+	return nil, fmt.Errorf("anthropic tool call: модель не вызвала %q", tool.Name)
 }
