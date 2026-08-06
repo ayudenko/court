@@ -128,6 +128,9 @@ func (s *Service) unlock() { <-s.mu }
 // зависших модераций после рестарта. Блокируется до отмены ctx.
 func (s *Service) Run(ctx context.Context) {
 	s.recover(ctx)
+	// Process deadlines once at startup so a turn that expired while the
+	// process was stopped is not left pending until the first ticker tick.
+	s.expireTurns(ctx)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -545,7 +548,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 		consensus = storedVerdict.Verdict.Consensus
 	} else if !lastRound {
 		if storedSummary != nil {
-			consensus = storedSummary.RoundSummary.Consensus
+			consensus = roundSummaryReachedConsensus(*storedSummary.RoundSummary)
 		} else {
 			summary, err := s.moderator.CheckRound(ctx, subject(d), transcript, d.CurrentRound, allowedSeqs)
 			s.lock()
@@ -554,6 +557,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 				_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
 					"Модератор недоступен, дискуссия продолжается без промежуточного итога.")
 			} else {
+				summary.Consensus = roundSummaryReachedConsensus(summary)
 				consensus = summary.Consensus
 				if _, err := s.appendSummary(debateID, d.CurrentRound, s.moderator.Name(), summary); err != nil {
 					s.log.Error("модерация: сохранение итога раунда", "debate", debateID, "err", err)
@@ -624,6 +628,10 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	}
 	s.hub.Publish(Event{Type: EventTurn, DebateID: d.ID, Round: d.CurrentRound,
 		AgentID: parts[0].AgentID, AgentName: parts[0].Name, Deadline: d.TurnDeadline})
+}
+
+func roundSummaryReachedConsensus(summary RoundSummary) bool {
+	return summary.Consensus && len(summary.UnresolvedQuestions) == 0
 }
 
 // moderateHybrid — режим hybrid: консенсус определяют голоса участников
