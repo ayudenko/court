@@ -1,7 +1,11 @@
 // Package core — доменная модель и логика дебатов.
 package core
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Agent — зарегистрированный внешний агент.
 type Agent struct {
@@ -95,6 +99,83 @@ type Vote struct {
 	AgentName    string `json:"agent_name"`
 	SupportsID   string `json:"supports_id"`
 	SupportsName string `json:"supports_name"`
+}
+
+// ModerationClaim — тезис модератора со ссылками на исходные сообщения по seq.
+// Ссылки сохраняют проверяемость резюме и вердикта после сокращения контекста.
+type ModerationClaim struct {
+	Text      string  `json:"text"`
+	Citations []int64 `json:"citations"`
+}
+
+// RoundSummary — типизированный результат модерации завершившегося раунда.
+type RoundSummary struct {
+	Summary             string            `json:"summary"`
+	Claims              []ModerationClaim `json:"claims"`
+	UnresolvedQuestions []string          `json:"unresolved_questions"`
+	Decisions           []string          `json:"decisions"`
+	Consensus           bool              `json:"consensus"`
+}
+
+// Text возвращает человекочитаемое представление структурированного резюме.
+// Бизнес-логика не разбирает этот текст: consensus берётся из отдельного поля.
+func (s RoundSummary) Text() string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(s.Summary))
+	renderClaims(&b, s.Claims)
+	renderList(&b, "Согласованные решения", s.Decisions)
+	renderList(&b, "Открытые вопросы", s.UnresolvedQuestions)
+	return strings.TrimSpace(b.String())
+}
+
+// ModerationVerdict — типизированное финальное решение модератора.
+type ModerationVerdict struct {
+	FinalAnswer         string            `json:"final_answer"`
+	Claims              []ModerationClaim `json:"claims"`
+	UnresolvedQuestions []string          `json:"unresolved_questions"`
+	Decisions           []string          `json:"decisions"`
+	Consensus           bool              `json:"consensus"`
+}
+
+// Text возвращает человекочитаемое представление структурированного вердикта.
+func (v ModerationVerdict) Text() string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(v.FinalAnswer))
+	renderClaims(&b, v.Claims)
+	renderList(&b, "Согласованные решения", v.Decisions)
+	renderList(&b, "Оставшиеся разногласия и открытые вопросы", v.UnresolvedQuestions)
+	return strings.TrimSpace(b.String())
+}
+
+func renderClaims(b *strings.Builder, claims []ModerationClaim) {
+	if len(claims) == 0 {
+		return
+	}
+	b.WriteString("\n\nКлючевые тезисы:\n")
+	for _, claim := range claims {
+		fmt.Fprintf(b, "- %s", strings.TrimSpace(claim.Text))
+		if len(claim.Citations) > 0 {
+			b.WriteString(" [")
+			for i, seq := range claim.Citations {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(b, "#%d", seq)
+			}
+			b.WriteString("]")
+		}
+		b.WriteByte('\n')
+	}
+}
+
+func renderList(b *strings.Builder, heading string, items []string) {
+	if len(items) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\n%s:\n", heading)
+	for _, item := range items {
+		fmt.Fprintf(b, "- %s\n", strings.TrimSpace(item))
+	}
 }
 
 // Типы событий для подписчиков (SSE, long-poll).

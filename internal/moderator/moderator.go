@@ -2,17 +2,25 @@
 package moderator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"regexp"
+	"strconv"
 	"strings"
 
+	"court/internal/core"
 	"court/internal/llm"
 )
 
 const (
-	consensusMarker     = "КОНСЕНСУС: ДА"
-	openQuestionsHeader = "ОТКРЫТЫЕ ВОПРОСЫ"
+	roundSummaryTool = "submit_round_summary"
+	verdictTool      = "submit_verdict"
 )
+
+var transcriptSeqPattern = regexp.MustCompile(`(?m)^\[#(\d+),`)
 
 // Moderator подводит итоги раундов и выносит вердикт через LLM.
 type Moderator struct {
@@ -39,7 +47,7 @@ func (m *Moderator) system(task string) string {
 }
 
 // CheckRound подводит итог раунда и определяет, достигнут ли консенсус.
-func (m *Moderator) CheckRound(ctx context.Context, question, transcript string, round int) (bool, string, error) {
+func (m *Moderator) CheckRound(ctx context.Context, question, transcript string, round int) (core.RoundSummary, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -49,44 +57,21 @@ func (m *Moderator) CheckRound(ctx context.Context, question, transcript string,
 %s
 
 Завершился раунд %d. Сделай следующее:
-1. Кратко (3–5 предложений) подведи итог раунда: по каким пунктам участники сходятся, по каким спорят.
-2. Перечисли открытые вопросы — предметные разногласия, по которым участники ещё не сошлись. Сюда входят и «детали, которые можно уточнить позже»: пока участники не согласовали их явно, вопрос открыт. Раздел начни строкой "ОТКРЫТЫЕ ВОПРОСЫ:", пункты дай нумерованным списком. Если открытых вопросов не осталось, напиши ровно "ОТКРЫТЫЕ ВОПРОСЫ: НЕТ".
-3. Последней строкой ответа напиши ровно одно из двух: "КОНСЕНСУС: ДА" или "КОНСЕНСУС: НЕТ". Консенсус возможен только при пустом списке открытых вопросов.`,
+1. Кратко подведи итог раунда.
+2. Выдели проверяемые тезисы и для каждого укажи seq исходных реплик из заголовков вида [#seq, участник].
+3. Перечисли согласованные решения и открытые предметные вопросы. «Детали, которые можно уточнить позже» остаются открытыми, пока участники явно их не согласовали.
+4. Отметь consensus=true только если открытых вопросов нет и участники явно согласовали решение.
+Верни результат только вызовом предоставленного инструмента.`,
 		question, transcript, round,
 	)
-	text, err := m.provider.Stream(ctx,
+	return m.roundSummary(ctx, transcript,
 		m.system("Твоя задача — подводить промежуточные итоги и определять, достигнут ли консенсус."),
-		[]llm.Message{{Role: llm.RoleUser, Content: prompt}}, nil)
-	if err != nil {
-		return false, "", err
-	}
-	consensus := strings.Contains(strings.ToUpper(text), consensusMarker) && openQuestionsEmpty(text)
-	return consensus, text, nil
-}
-
-// openQuestionsEmpty сообщает, пуст ли раздел "ОТКРЫТЫЕ ВОПРОСЫ" в ответе
-// модератора. Консенсус засчитывается только при явном "ОТКРЫТЫЕ ВОПРОСЫ: НЕТ":
-// раздел с пунктами или без раздела вовсе — вопросы считаются оставшимися,
-// даже если модель написала "КОНСЕНСУС: ДА".
-func openQuestionsEmpty(text string) bool {
-	up := strings.ToUpper(text)
-	idx := strings.Index(up, openQuestionsHeader)
-	if idx < 0 {
-		return false
-	}
-	for _, line := range strings.Split(up[idx+len(openQuestionsHeader):], "\n") {
-		line = strings.Trim(line, " \t:*#._-")
-		if line == "" {
-			continue
-		}
-		return strings.HasPrefix(line, "НЕТ")
-	}
-	return false
+		[]llm.Message{{Role: llm.RoleUser, Content: prompt}})
 }
 
 // Summary подводит итог раунда без решения о консенсусе (режим hybrid,
 // где консенсус определяют голоса участников).
-func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int) (string, error) {
+func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int) (core.RoundSummary, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -98,16 +83,18 @@ func (m *Moderator) Summary(ctx context.Context, question, transcript string, ro
 Завершился раунд %d. Кратко (3–5 предложений) подведи итог раунда:
 по каким пунктам участники сходятся, по каким спорят, чьи позиции получают
 поддержку (голоса участников указаны в протоколе). Решение о консенсусе
-принимают сами участники голосованием — не выноси его за них.`,
+принимают сами участники голосованием — не выноси его за них и установи
+consensus=false. Для каждого тезиса укажи seq исходных реплик из заголовков
+вида [#seq, участник]. Верни результат только вызовом предоставленного инструмента.`,
 		question, transcript, round,
 	)
-	return m.provider.Stream(ctx,
+	return m.roundSummary(ctx, transcript,
 		m.system("Твоя задача — подводить промежуточные итоги дискуссии."),
-		[]llm.Message{{Role: llm.RoleUser, Content: prompt}}, nil)
+		[]llm.Message{{Role: llm.RoleUser, Content: prompt}})
 }
 
 // Verdict выносит итоговое решение по завершённой дискуссии.
-func (m *Moderator) Verdict(ctx context.Context, question, transcript string) (string, error) {
+func (m *Moderator) Verdict(ctx context.Context, question, transcript string) (core.ModerationVerdict, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -118,11 +105,195 @@ func (m *Moderator) Verdict(ctx context.Context, question, transcript string) (s
 
 Дискуссия завершена. Сформулируй итог:
 1. Финальный ответ на вопрос — согласованное решение или, если консенсуса нет, наиболее обоснованная позиция.
-2. Ключевые аргументы, на которых оно основано (укажи, кто их высказал).
-3. Оставшиеся разногласия и открытые вопросы, если они есть.`,
+2. Ключевые тезисы, на которых оно основано; для каждого укажи seq исходных реплик из заголовков вида [#seq, участник].
+3. Согласованные решения и оставшиеся разногласия или открытые вопросы.
+4. Установи consensus=true только если открытых вопросов нет и участники явно согласовали решение.
+Верни результат только вызовом предоставленного инструмента.`,
 		question, transcript,
 	)
-	return m.provider.Stream(ctx,
+	tool := verdictSchema()
+	raw, err := m.provider.CallTool(ctx,
 		m.system("Дискуссия завершена — твоя задача вынести итоговое решение."),
-		[]llm.Message{{Role: llm.RoleUser, Content: prompt}}, nil)
+		[]llm.Message{{Role: llm.RoleUser, Content: prompt}}, tool)
+	if err != nil {
+		return core.ModerationVerdict{}, err
+	}
+	result, err := decodeStructured[core.ModerationVerdict](raw, tool.Required)
+	if err != nil {
+		return core.ModerationVerdict{}, fmt.Errorf("структурированный вердикт: %w", err)
+	}
+	if err := validateVerdict(result, transcript); err != nil {
+		return core.ModerationVerdict{}, fmt.Errorf("структурированный вердикт: %w", err)
+	}
+	return result, nil
+}
+
+func (m *Moderator) roundSummary(ctx context.Context, transcript, system string, msgs []llm.Message) (core.RoundSummary, error) {
+	tool := roundSummarySchema()
+	raw, err := m.provider.CallTool(ctx, system, msgs, tool)
+	if err != nil {
+		return core.RoundSummary{}, err
+	}
+	result, err := decodeStructured[core.RoundSummary](raw, tool.Required)
+	if err != nil {
+		return core.RoundSummary{}, fmt.Errorf("структурированное резюме: %w", err)
+	}
+	if err := validateRoundSummary(result, transcript); err != nil {
+		return core.RoundSummary{}, fmt.Errorf("структурированное резюме: %w", err)
+	}
+	return result, nil
+}
+
+func roundSummarySchema() llm.Tool {
+	return llm.Tool{
+		Name:        roundSummaryTool,
+		Description: "Return the typed summary of a completed debate round.",
+		Properties: map[string]any{
+			"summary":              map[string]any{"type": "string", "description": "Concise round summary."},
+			"claims":               claimsSchema(),
+			"unresolved_questions": stringArraySchema("Substantive questions the participants have not resolved."),
+			"decisions":            stringArraySchema("Decisions explicitly agreed by the participants."),
+			"consensus":            map[string]any{"type": "boolean", "description": "True only when the unresolved_questions array is empty and the participants explicitly agree."},
+		},
+		Required: []string{"summary", "claims", "unresolved_questions", "decisions", "consensus"},
+	}
+}
+
+func verdictSchema() llm.Tool {
+	return llm.Tool{
+		Name:        verdictTool,
+		Description: "Return the typed final verdict for a completed debate.",
+		Properties: map[string]any{
+			"final_answer":         map[string]any{"type": "string", "description": "The final answer to the debate question."},
+			"claims":               claimsSchema(),
+			"unresolved_questions": stringArraySchema("Remaining disagreements or open questions."),
+			"decisions":            stringArraySchema("Decisions explicitly agreed by the participants."),
+			"consensus":            map[string]any{"type": "boolean", "description": "True only when the unresolved_questions array is empty and the participants explicitly agree."},
+		},
+		Required: []string{"final_answer", "claims", "unresolved_questions", "decisions", "consensus"},
+	}
+}
+
+func claimsSchema() map[string]any {
+	return map[string]any{
+		"type": "array",
+		"items": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"text": map[string]any{"type": "string", "description": "A claim grounded in the transcript."},
+				"citations": map[string]any{
+					"type":        "array",
+					"minItems":    1,
+					"items":       map[string]any{"type": "integer", "minimum": 1},
+					"description": "Message seq values supporting the claim.",
+				},
+			},
+			"required": []string{"text", "citations"},
+		},
+	}
+}
+
+func stringArraySchema(description string) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"items":       map[string]any{"type": "string"},
+		"description": description,
+	}
+}
+
+func decodeStructured[T any](raw json.RawMessage, required []string) (T, error) {
+	var result T
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return result, err
+	}
+	for _, field := range required {
+		value, ok := fields[field]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return result, fmt.Errorf("обязательное поле %q отсутствует или равно null", field)
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return result, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return result, fmt.Errorf("лишние данные после JSON-объекта")
+		}
+		return result, err
+	}
+	return result, nil
+}
+
+func validateRoundSummary(summary core.RoundSummary, transcript string) error {
+	if strings.TrimSpace(summary.Summary) == "" {
+		return fmt.Errorf("summary обязателен")
+	}
+	if summary.Consensus && len(summary.UnresolvedQuestions) > 0 {
+		return fmt.Errorf("consensus=true при непустом unresolved_questions")
+	}
+	if err := validateStrings("unresolved_questions", summary.UnresolvedQuestions); err != nil {
+		return err
+	}
+	if err := validateStrings("decisions", summary.Decisions); err != nil {
+		return err
+	}
+	return validateClaims(summary.Claims, transcript)
+}
+
+func validateVerdict(verdict core.ModerationVerdict, transcript string) error {
+	if strings.TrimSpace(verdict.FinalAnswer) == "" {
+		return fmt.Errorf("final_answer обязателен")
+	}
+	if verdict.Consensus && len(verdict.UnresolvedQuestions) > 0 {
+		return fmt.Errorf("consensus=true при непустом unresolved_questions")
+	}
+	if err := validateStrings("unresolved_questions", verdict.UnresolvedQuestions); err != nil {
+		return err
+	}
+	if err := validateStrings("decisions", verdict.Decisions); err != nil {
+		return err
+	}
+	return validateClaims(verdict.Claims, transcript)
+}
+
+func validateStrings(field string, values []string) error {
+	for i, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s[%d] пуст", field, i)
+		}
+	}
+	return nil
+}
+
+func validateClaims(claims []core.ModerationClaim, transcript string) error {
+	available := transcriptSeqs(transcript)
+	for i, claim := range claims {
+		if strings.TrimSpace(claim.Text) == "" {
+			return fmt.Errorf("claims[%d].text пуст", i)
+		}
+		if len(claim.Citations) == 0 {
+			return fmt.Errorf("claims[%d].citations пуст", i)
+		}
+		for _, seq := range claim.Citations {
+			if _, ok := available[seq]; !ok {
+				return fmt.Errorf("claims[%d] ссылается на отсутствующий seq #%d", i, seq)
+			}
+		}
+	}
+	return nil
+}
+
+func transcriptSeqs(transcript string) map[int64]struct{} {
+	seqs := make(map[int64]struct{})
+	for _, match := range transcriptSeqPattern.FindAllStringSubmatch(transcript, -1) {
+		seq, err := strconv.ParseInt(match[1], 10, 64)
+		if err == nil {
+			seqs[seq] = struct{}{}
+		}
+	}
+	return seqs
 }

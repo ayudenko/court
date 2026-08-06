@@ -59,11 +59,11 @@ type Moderator interface {
 	Name() string
 	// CheckRound подводит итог раунда и решает, достигнут ли консенсус
 	// (режим moderator).
-	CheckRound(ctx context.Context, question, transcript string, round int) (consensus bool, summary string, err error)
+	CheckRound(ctx context.Context, question, transcript string, round int) (RoundSummary, error)
 	// Summary подводит итог раунда без решения о консенсусе (режим hybrid).
-	Summary(ctx context.Context, question, transcript string, round int) (string, error)
+	Summary(ctx context.Context, question, transcript string, round int) (RoundSummary, error)
 	// Verdict выносит финальное решение по всей дискуссии.
-	Verdict(ctx context.Context, question, transcript string) (string, error)
+	Verdict(ctx context.Context, question, transcript string) (ModerationVerdict, error)
 }
 
 // Service — вся бизнес-логика дебатов. Потокобезопасен.
@@ -493,16 +493,15 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	consensus := false
 	lastRound := d.CurrentRound >= d.Rounds
 	if !lastRound {
-		var summary string
-		var err error
-		consensus, summary, err = s.moderator.CheckRound(ctx, subject(d), transcript, d.CurrentRound)
+		summary, err := s.moderator.CheckRound(ctx, subject(d), transcript, d.CurrentRound)
 		s.lock()
 		if err != nil {
 			s.log.Error("модерация: итог раунда", "debate", debateID, "err", err)
 			s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
 				"Модератор недоступен, дискуссия продолжается без промежуточного итога.")
 		} else {
-			s.appendMessage(debateID, d.CurrentRound, "", s.moderator.Name(), KindSummary, summary)
+			consensus = summary.Consensus
+			s.appendMessage(debateID, d.CurrentRound, "", s.moderator.Name(), KindSummary, summary.Text())
 			transcript, _ = s.renderTranscript(debateID)
 		}
 		s.unlock()
@@ -517,7 +516,8 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
 				"Модератор недоступен, дебаты завершены без вердикта.")
 		} else {
-			s.appendMessage(debateID, d.CurrentRound, "", s.moderator.Name(), KindVerdict, verdict)
+			consensus = verdict.Consensus
+			s.appendMessage(debateID, d.CurrentRound, "", s.moderator.Name(), KindVerdict, verdict.Text())
 		}
 		d.Status = StatusConcluded
 		d.Consensus = consensus
@@ -574,7 +574,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 			s.log.Warn("гибрид: резюме раунда недоступно", "debate", d.ID, "err", err)
 		} else {
 			s.lock()
-			s.appendMessage(d.ID, d.CurrentRound, "", s.moderator.Name(), KindSummary, summary)
+			s.appendMessage(d.ID, d.CurrentRound, "", s.moderator.Name(), KindSummary, summary.Text())
 			s.unlock()
 		}
 		s.lock()
@@ -595,14 +595,15 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	// Завершение: вердикт LLM, при недоступности — детерминированный по голосам.
 	verdict, err := s.moderator.Verdict(ctx, subject(d), renderTranscriptText(msgs))
 	speaker := s.moderator.Name()
+	verdictText := verdict.Text()
 	if err != nil {
 		s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)
-		verdict = hybridVerdict(votes, msgs, consensus)
+		verdictText = hybridVerdict(votes, msgs, consensus)
 		speaker = "система"
 	}
 	s.lock()
 	defer s.unlock()
-	s.appendMessage(d.ID, d.CurrentRound, "", speaker, KindVerdict, verdict)
+	s.appendMessage(d.ID, d.CurrentRound, "", speaker, KindVerdict, verdictText)
 	d.Status = StatusConcluded
 	d.Consensus = consensus
 	d.TurnAgentID = ""
@@ -857,7 +858,7 @@ func renderTranscriptText(msgs []Message) string {
 		if m.SupportName != "" && m.SupportID != m.SpeakerID {
 			header += " (поддерживает позицию: " + m.SupportName + ")"
 		}
-		fmt.Fprintf(&sb, "[%s]:\n%s\n\n", header, strings.TrimSpace(m.Text))
+		fmt.Fprintf(&sb, "[#%d, %s]:\n%s\n\n", m.Seq, header, strings.TrimSpace(m.Text))
 	}
 	return sb.String()
 }

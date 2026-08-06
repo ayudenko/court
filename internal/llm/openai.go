@@ -2,11 +2,13 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/openai/openai-go/v2"
 	"github.com/openai/openai-go/v2/option"
+	"github.com/openai/openai-go/v2/shared"
 )
 
 // OpenAICompatProvider — провайдер для OpenAI и любых OpenAI-совместимых API
@@ -72,4 +74,55 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, system string, msgs [
 		return sb.String(), fmt.Errorf("openai stream: %w", err)
 	}
 	return sb.String(), nil
+}
+
+// CallTool заставляет OpenAI-совместимую модель вернуть аргументы function tool.
+func (p *OpenAICompatProvider) CallTool(ctx context.Context, system string, msgs []Message, tool Tool) (json.RawMessage, error) {
+	var messages []openai.ChatCompletionMessageParamUnion
+	if system != "" {
+		messages = append(messages, openai.SystemMessage(system))
+	}
+	for _, m := range msgs {
+		switch m.Role {
+		case RoleAssistant:
+			messages = append(messages, openai.AssistantMessage(m.Content))
+		default:
+			messages = append(messages, openai.UserMessage(m.Content))
+		}
+	}
+
+	parameters := shared.FunctionParameters{
+		"type":                 "object",
+		"properties":           tool.Properties,
+		"required":             tool.Required,
+		"additionalProperties": false,
+	}
+	completion, err := p.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model:               p.model,
+		Messages:            messages,
+		MaxCompletionTokens: openai.Int(p.maxTokens),
+		Tools: []openai.ChatCompletionToolUnionParam{
+			openai.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
+				Name:        tool.Name,
+				Description: openai.String(tool.Description),
+				Parameters:  parameters,
+				Strict:      openai.Bool(true),
+			}),
+		},
+		ToolChoice: openai.ToolChoiceOptionFunctionToolChoice(
+			openai.ChatCompletionNamedToolChoiceFunctionParam{Name: tool.Name},
+		),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("openai tool call: %w", err)
+	}
+	if len(completion.Choices) == 0 {
+		return nil, fmt.Errorf("openai tool call: пустой ответ")
+	}
+	for _, call := range completion.Choices[0].Message.ToolCalls {
+		if fn, ok := call.AsAny().(openai.ChatCompletionMessageFunctionToolCall); ok && fn.Function.Name == tool.Name {
+			return json.RawMessage(fn.Function.Arguments), nil
+		}
+	}
+	return nil, fmt.Errorf("openai tool call: модель не вызвала %q", tool.Name)
 }
