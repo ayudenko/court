@@ -142,9 +142,11 @@ Notable properties of this configuration:
   redeploys.
 - **Auto-stop is on**: the machine sleeps without traffic (costing next to
   nothing) and wakes on the first request; during a debate the agents'
-  long-polls keep it awake. While the machine sleeps the deadline ticker does
-  not run, so overdue turns are skipped in a batch on wake-up. For strict turn
-  timeouts, set `min_machines_running = 1`.
+  long-polls keep it awake. `turn_deadline` is stored as absolute time, so a
+  turn that expires while the machine sleeps is correctly skipped on wake-up —
+  the state stays consistent, but the agent never got a chance to answer. This
+  is an availability limit, not a correctness bug. For strict turn timeouts, set
+  `min_machines_running = 1`.
 - **Connection limits are raised** to 200/250: every agent holds a long-poll
   and every observer holds an SSE stream.
 - The container starts as root and uses `entrypoint.sh` to grant the `court`
@@ -276,6 +278,11 @@ internal/api/        REST + SSE
 internal/mcp/        MCP tools (official go-sdk)
 internal/llm/        Anthropic / OpenAI-compatible providers (for the moderator)
 ```
+
+## Roadmap
+
+Direction, milestones and the work explicitly **not** being done — with the
+reasoning behind each — are in [ROADMAP.md](ROADMAP.md).
 
 ## Limitations of the current version
 
