@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,9 +17,15 @@ import (
 // ErrNotFound возвращается, когда запись не найдена.
 var ErrNotFound = errors.New("не найдено")
 
+// currentModerationSchemaVersion evolves independently from the public SSE and
+// JSONL protocol version so persisted v1 evidence remains readable after a
+// future public protocol bump.
+const currentModerationSchemaVersion = 1
+
 // Store — обёртка над SQLite.
 type Store struct {
-	db *sql.DB
+	db                    *sql.DB
+	hasAgentKeyHashShadow bool
 }
 
 const schema = `
@@ -28,6 +35,13 @@ CREATE TABLE IF NOT EXISTS agents (
 	persona      TEXT NOT NULL DEFAULT '',
 	api_key_hash TEXT NOT NULL UNIQUE,
 	created_at   TIMESTAMP NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_credentials (
+	id         TEXT PRIMARY KEY,
+	agent_id   TEXT NOT NULL REFERENCES agents(id),
+	key_hash   TEXT NOT NULL UNIQUE,
+	created_at TIMESTAMP NOT NULL,
+	revoked_at TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS debates (
 	id            TEXT PRIMARY KEY,
@@ -62,10 +76,12 @@ CREATE TABLE IF NOT EXISTS messages (
 	text         TEXT NOT NULL,
 	support_id   TEXT NOT NULL DEFAULT '',
 	support_name TEXT NOT NULL DEFAULT '',
+	moderation_json TEXT,
 	created_at   TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_debate ON messages(debate_id, seq);
 CREATE INDEX IF NOT EXISTS idx_debates_status ON debates(status);
+CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON agent_credentials(agent_id);
 `
 
 // Open открывает базу и применяет схему.
@@ -86,12 +102,43 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE debates ADD COLUMN prep_time INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE messages ADD COLUMN support_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN support_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE messages ADD COLUMN moderation_json TEXT`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return nil, fmt.Errorf("миграция схемы: %w", err)
 		}
 	}
-	return &Store{db: db}, nil
+	hasAgentKeyHashShadow, err := columnExists(db, "agents", "api_key_hash")
+	if err != nil {
+		return nil, fmt.Errorf("проверка legacy-схемы credentials: %w", err)
+	}
+	if hasAgentKeyHashShadow {
+		if _, err := db.Exec(`
+			INSERT INTO agent_credentials (id, agent_id, key_hash, created_at)
+			SELECT 'crd_legacy_' || id, id, api_key_hash, created_at
+			FROM agents a
+			WHERE api_key_hash <> ''
+			  AND NOT EXISTS (
+				SELECT 1 FROM agent_credentials c WHERE c.key_hash = a.api_key_hash
+			  )
+		`); err != nil {
+			return nil, fmt.Errorf("миграция legacy credentials: %w", err)
+		}
+		var missing int
+		if err := db.QueryRow(`
+			SELECT COUNT(*)
+			FROM agents a
+			LEFT JOIN agent_credentials c
+			  ON c.key_hash = a.api_key_hash AND c.agent_id = a.id
+			WHERE a.api_key_hash <> '' AND c.id IS NULL
+		`).Scan(&missing); err != nil {
+			return nil, fmt.Errorf("проверка legacy credentials: %w", err)
+		}
+		if missing != 0 {
+			return nil, fmt.Errorf("миграция legacy credentials: %d ключей не связаны со своими агентами", missing)
+		}
+	}
+	return &Store{db: db, hasAgentKeyHashShadow: hasAgentKeyHashShadow}, nil
 }
 
 // Close закрывает базу.
@@ -99,19 +146,73 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // --- Агенты ---
 
-// CreateAgent сохраняет агента с хэшем его API-ключа.
-func (s *Store) CreateAgent(a core.Agent, keyHash string) error {
+// CreateAgent атомарно сохраняет стабильного агента и его первый credential.
+func (s *Store) CreateAgent(a core.Agent, credential core.Credential, keyHash string) error {
+	if credential.AgentID != a.ID || credential.ID == "" || keyHash == "" {
+		return errors.New("credential не соответствует агенту")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if s.hasAgentKeyHashShadow {
+		_, err = tx.Exec(
+			`INSERT INTO agents (id, name, persona, api_key_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
+			a.ID, a.Name, a.Persona, keyHash, a.CreatedAt,
+		)
+	} else {
+		_, err = tx.Exec(
+			`INSERT INTO agents (id, name, persona, created_at) VALUES (?, ?, ?, ?)`,
+			a.ID, a.Name, a.Persona, a.CreatedAt,
+		)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO agent_credentials (id, agent_id, key_hash, created_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		credential.ID, credential.AgentID, keyHash, credential.CreatedAt, nullTimePtr(credential.RevokedAt),
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CreateCredential добавляет ещё один независимо отзываемый ключ агента.
+func (s *Store) CreateCredential(credential core.Credential, keyHash string) error {
+	if credential.ID == "" || credential.AgentID == "" || keyHash == "" {
+		return errors.New("неполный credential")
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO agents (id, name, persona, api_key_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.Persona, keyHash, a.CreatedAt,
+		`INSERT INTO agent_credentials (id, agent_id, key_hash, created_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		credential.ID, credential.AgentID, keyHash, credential.CreatedAt, nullTimePtr(credential.RevokedAt),
 	)
 	return err
 }
 
-// AgentByKeyHash ищет агента по хэшу API-ключа.
-func (s *Store) AgentByKeyHash(hash string) (core.Agent, error) {
-	return s.scanAgent(s.db.QueryRow(
-		`SELECT id, name, persona, created_at FROM agents WHERE api_key_hash = ?`, hash))
+// RevokeCredential запрещает дальнейшую аутентификацию по credential.
+func (s *Store) RevokeCredential(id string, at time.Time) error {
+	res, err := s.db.Exec(
+		`UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, at, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// AgentByCredentialHash ищет агента по активному credential.
+func (s *Store) AgentByCredentialHash(hash string) (core.Agent, error) {
+	return s.scanAgent(s.db.QueryRow(`
+		SELECT a.id, a.name, a.persona, a.created_at
+		FROM agent_credentials c
+		JOIN agents a ON a.id = c.agent_id
+		WHERE c.key_hash = ? AND c.revoked_at IS NULL`, hash))
 }
 
 // AgentByID ищет агента по идентификатору.
@@ -268,12 +369,16 @@ func (s *Store) Participants(debateID string) ([]core.Participant, error) {
 
 // AddMessage сохраняет запись протокола и возвращает её порядковый номер.
 func (s *Store) AddMessage(m core.Message) (int64, error) {
+	moderationJSON, err := encodeModeration(m)
+	if err != nil {
+		return 0, err
+	}
 	res, err := s.db.Exec(
 		`INSERT INTO messages (debate_id, round, speaker_id, speaker_name, kind, text,
-		                       support_id, support_name, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                       support_id, support_name, moderation_json, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.DebateID, m.Round, m.SpeakerID, m.SpeakerName, m.Kind, m.Text,
-		m.SupportID, m.SupportName, m.CreatedAt,
+		m.SupportID, m.SupportName, nullString(moderationJSON), m.CreatedAt,
 	)
 	if err != nil {
 		return 0, err
@@ -285,7 +390,7 @@ func (s *Store) AddMessage(m core.Message) (int64, error) {
 func (s *Store) Messages(debateID string, afterSeq int64) ([]core.Message, error) {
 	rows, err := s.db.Query(
 		`SELECT seq, debate_id, round, speaker_id, speaker_name, kind, text,
-		        support_id, support_name, created_at
+		        support_id, support_name, moderation_json, created_at
 		 FROM messages WHERE debate_id = ? AND seq > ? ORDER BY seq`, debateID, afterSeq)
 	if err != nil {
 		return nil, err
@@ -294,9 +399,13 @@ func (s *Store) Messages(debateID string, afterSeq int64) ([]core.Message, error
 	var out []core.Message
 	for rows.Next() {
 		var m core.Message
+		var moderationJSON sql.NullString
 		if err := rows.Scan(&m.Seq, &m.DebateID, &m.Round, &m.SpeakerID,
-			&m.SpeakerName, &m.Kind, &m.Text, &m.SupportID, &m.SupportName, &m.CreatedAt); err != nil {
+			&m.SpeakerName, &m.Kind, &m.Text, &m.SupportID, &m.SupportName, &moderationJSON, &m.CreatedAt); err != nil {
 			return nil, err
+		}
+		if err := decodeModeration(&m, moderationJSON.String); err != nil {
+			return nil, fmt.Errorf("message %d moderation payload: %w", m.Seq, err)
 		}
 		out = append(out, m)
 	}
@@ -308,6 +417,187 @@ func nullTime(t time.Time) any {
 		return nil
 	}
 	return t
+}
+
+func nullTimePtr(t *time.Time) any {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return *t
+}
+
+func nullString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func encodeModeration(m core.Message) (string, error) {
+	if m.RoundSummary != nil && m.Verdict != nil {
+		return "", errors.New("message cannot contain both round_summary and verdict")
+	}
+	payload := storedModerationV1{SchemaVersion: currentModerationSchemaVersion}
+	switch m.Kind {
+	case core.KindSummary:
+		if m.RoundSummary == nil || m.Verdict != nil {
+			return "", errors.New("new summary message requires exactly one round_summary payload")
+		}
+		roundSummary := storedRoundSummaryV1FromCore(*m.RoundSummary)
+		payload.RoundSummary = &roundSummary
+	case core.KindVerdict:
+		if m.Verdict == nil || m.RoundSummary != nil {
+			return "", errors.New("new verdict message requires exactly one verdict payload")
+		}
+		verdict := storedVerdictV1FromCore(*m.Verdict)
+		payload.Verdict = &verdict
+	case core.KindArgument, core.KindSystem:
+		if m.RoundSummary != nil || m.Verdict != nil {
+			return "", fmt.Errorf("message kind %q cannot contain moderation payload", m.Kind)
+		}
+		return "", nil
+	default:
+		return "", fmt.Errorf("unsupported message kind %q", m.Kind)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("encode moderation payload: %w", err)
+	}
+	return string(data), nil
+}
+
+func decodeModeration(m *core.Message, payload string) error {
+	if payload == "" {
+		m.LegacyUnstructured = m.Kind == core.KindSummary || m.Kind == core.KindVerdict
+		return nil
+	}
+	var stored storedModerationV1
+	if err := json.Unmarshal([]byte(payload), &stored); err != nil {
+		return err
+	}
+	if stored.SchemaVersion != currentModerationSchemaVersion {
+		return fmt.Errorf("unsupported schema_version %d", stored.SchemaVersion)
+	}
+	if stored.RoundSummary != nil && stored.Verdict != nil {
+		return errors.New("moderation payload contains both round_summary and verdict")
+	}
+	switch {
+	case m.Kind == core.KindSummary && stored.RoundSummary != nil:
+		roundSummary := stored.RoundSummary.toCore()
+		m.RoundSummary = &roundSummary
+	case m.Kind == core.KindVerdict && stored.Verdict != nil:
+		verdict := stored.Verdict.toCore()
+		m.Verdict = &verdict
+	default:
+		return fmt.Errorf("kind %q does not match moderation payload", m.Kind)
+	}
+	return nil
+}
+
+// The v1 durable DTOs intentionally do not embed core/public protocol types.
+// Their JSON shape is immutable for the lifetime of durable schema v1; changes
+// to core JSON tags therefore cannot silently reinterpret already stored rows.
+type storedModerationV1 struct {
+	SchemaVersion int                   `json:"schema_version"`
+	RoundSummary  *storedRoundSummaryV1 `json:"round_summary,omitempty"`
+	Verdict       *storedVerdictV1      `json:"verdict,omitempty"`
+}
+
+type storedClaimV1 struct {
+	Text      string  `json:"text"`
+	Citations []int64 `json:"citations"`
+}
+
+type storedRoundSummaryV1 struct {
+	Summary             string          `json:"summary"`
+	Claims              []storedClaimV1 `json:"claims"`
+	UnresolvedQuestions []string        `json:"unresolved_questions"`
+	Decisions           []string        `json:"decisions"`
+	Consensus           bool            `json:"consensus"`
+}
+
+type storedVerdictV1 struct {
+	FinalAnswer         string          `json:"final_answer"`
+	Claims              []storedClaimV1 `json:"claims"`
+	UnresolvedQuestions []string        `json:"unresolved_questions"`
+	Decisions           []string        `json:"decisions"`
+	Consensus           bool            `json:"consensus"`
+}
+
+func storedClaimsV1FromCore(claims []core.ModerationClaim) []storedClaimV1 {
+	result := make([]storedClaimV1, len(claims))
+	for i, claim := range claims {
+		result[i] = storedClaimV1{Text: claim.Text, Citations: claim.Citations}
+	}
+	return result
+}
+
+func storedClaimsV1ToCore(claims []storedClaimV1) []core.ModerationClaim {
+	result := make([]core.ModerationClaim, len(claims))
+	for i, claim := range claims {
+		result[i] = core.ModerationClaim{Text: claim.Text, Citations: claim.Citations}
+	}
+	return result
+}
+
+func storedRoundSummaryV1FromCore(summary core.RoundSummary) storedRoundSummaryV1 {
+	return storedRoundSummaryV1{
+		Summary:             summary.Summary,
+		Claims:              storedClaimsV1FromCore(summary.Claims),
+		UnresolvedQuestions: summary.UnresolvedQuestions,
+		Decisions:           summary.Decisions,
+		Consensus:           summary.Consensus,
+	}
+}
+
+func (summary storedRoundSummaryV1) toCore() core.RoundSummary {
+	return core.RoundSummary{
+		Summary:             summary.Summary,
+		Claims:              storedClaimsV1ToCore(summary.Claims),
+		UnresolvedQuestions: summary.UnresolvedQuestions,
+		Decisions:           summary.Decisions,
+		Consensus:           summary.Consensus,
+	}
+}
+
+func storedVerdictV1FromCore(verdict core.ModerationVerdict) storedVerdictV1 {
+	return storedVerdictV1{
+		FinalAnswer:         verdict.FinalAnswer,
+		Claims:              storedClaimsV1FromCore(verdict.Claims),
+		UnresolvedQuestions: verdict.UnresolvedQuestions,
+		Decisions:           verdict.Decisions,
+		Consensus:           verdict.Consensus,
+	}
+}
+
+func (verdict storedVerdictV1) toCore() core.ModerationVerdict {
+	return core.ModerationVerdict{
+		FinalAnswer:         verdict.FinalAnswer,
+		Claims:              storedClaimsV1ToCore(verdict.Claims),
+		UnresolvedQuestions: verdict.UnresolvedQuestions,
+		Decisions:           verdict.Decisions,
+		Consensus:           verdict.Consensus,
+	}
+}
+
+func columnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func boolInt(b bool) int {

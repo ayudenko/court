@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
-	"strconv"
 	"strings"
 
 	"court/internal/core"
@@ -19,8 +17,6 @@ const (
 	roundSummaryTool = "submit_round_summary"
 	verdictTool      = "submit_verdict"
 )
-
-var transcriptSeqPattern = regexp.MustCompile(`(?m)^\[#(\d+),`)
 
 // Moderator подводит итоги раундов и выносит вердикт через LLM.
 type Moderator struct {
@@ -47,7 +43,7 @@ func (m *Moderator) system(task string) string {
 }
 
 // CheckRound подводит итог раунда и определяет, достигнут ли консенсус.
-func (m *Moderator) CheckRound(ctx context.Context, question, transcript string, round int) (core.RoundSummary, error) {
+func (m *Moderator) CheckRound(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (core.RoundSummary, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -64,14 +60,14 @@ func (m *Moderator) CheckRound(ctx context.Context, question, transcript string,
 Верни результат только вызовом предоставленного инструмента.`,
 		question, transcript, round,
 	)
-	return m.roundSummary(ctx, transcript,
+	return m.roundSummary(ctx, allowedSeqs,
 		m.system("Твоя задача — подводить промежуточные итоги и определять, достигнут ли консенсус."),
 		[]llm.Message{{Role: llm.RoleUser, Content: prompt}})
 }
 
 // Summary подводит итог раунда без решения о консенсусе (режим hybrid,
 // где консенсус определяют голоса участников).
-func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int) (core.RoundSummary, error) {
+func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (core.RoundSummary, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -88,13 +84,13 @@ consensus=false. Для каждого тезиса укажи seq исходн�
 вида [#seq, участник]. Верни результат только вызовом предоставленного инструмента.`,
 		question, transcript, round,
 	)
-	return m.roundSummary(ctx, transcript,
+	return m.roundSummary(ctx, allowedSeqs,
 		m.system("Твоя задача — подводить промежуточные итоги дискуссии."),
 		[]llm.Message{{Role: llm.RoleUser, Content: prompt}})
 }
 
 // Verdict выносит итоговое решение по завершённой дискуссии.
-func (m *Moderator) Verdict(ctx context.Context, question, transcript string) (core.ModerationVerdict, error) {
+func (m *Moderator) Verdict(ctx context.Context, question, transcript string, allowedSeqs []int64) (core.ModerationVerdict, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -122,13 +118,13 @@ func (m *Moderator) Verdict(ctx context.Context, question, transcript string) (c
 	if err != nil {
 		return core.ModerationVerdict{}, fmt.Errorf("структурированный вердикт: %w", err)
 	}
-	if err := validateVerdict(result, transcript); err != nil {
+	if err := validateVerdict(result, allowedSeqs); err != nil {
 		return core.ModerationVerdict{}, fmt.Errorf("структурированный вердикт: %w", err)
 	}
 	return result, nil
 }
 
-func (m *Moderator) roundSummary(ctx context.Context, transcript, system string, msgs []llm.Message) (core.RoundSummary, error) {
+func (m *Moderator) roundSummary(ctx context.Context, allowedSeqs []int64, system string, msgs []llm.Message) (core.RoundSummary, error) {
 	tool := roundSummarySchema()
 	raw, err := m.provider.CallTool(ctx, system, msgs, tool)
 	if err != nil {
@@ -138,7 +134,7 @@ func (m *Moderator) roundSummary(ctx context.Context, transcript, system string,
 	if err != nil {
 		return core.RoundSummary{}, fmt.Errorf("структурированное резюме: %w", err)
 	}
-	if err := validateRoundSummary(result, transcript); err != nil {
+	if err := validateRoundSummary(result, allowedSeqs); err != nil {
 		return core.RoundSummary{}, fmt.Errorf("структурированное резюме: %w", err)
 	}
 	return result, nil
@@ -228,7 +224,7 @@ func decodeStructured[T any](raw json.RawMessage, required []string) (T, error) 
 	return result, nil
 }
 
-func validateRoundSummary(summary core.RoundSummary, transcript string) error {
+func validateRoundSummary(summary core.RoundSummary, allowedSeqs []int64) error {
 	if strings.TrimSpace(summary.Summary) == "" {
 		return fmt.Errorf("summary обязателен")
 	}
@@ -241,10 +237,10 @@ func validateRoundSummary(summary core.RoundSummary, transcript string) error {
 	if err := validateStrings("decisions", summary.Decisions); err != nil {
 		return err
 	}
-	return validateClaims(summary.Claims, transcript)
+	return validateClaims(summary.Claims, allowedSeqs)
 }
 
-func validateVerdict(verdict core.ModerationVerdict, transcript string) error {
+func validateVerdict(verdict core.ModerationVerdict, allowedSeqs []int64) error {
 	if strings.TrimSpace(verdict.FinalAnswer) == "" {
 		return fmt.Errorf("final_answer обязателен")
 	}
@@ -257,7 +253,7 @@ func validateVerdict(verdict core.ModerationVerdict, transcript string) error {
 	if err := validateStrings("decisions", verdict.Decisions); err != nil {
 		return err
 	}
-	return validateClaims(verdict.Claims, transcript)
+	return validateClaims(verdict.Claims, allowedSeqs)
 }
 
 func validateStrings(field string, values []string) error {
@@ -269,8 +265,11 @@ func validateStrings(field string, values []string) error {
 	return nil
 }
 
-func validateClaims(claims []core.ModerationClaim, transcript string) error {
-	available := transcriptSeqs(transcript)
+func validateClaims(claims []core.ModerationClaim, allowedSeqs []int64) error {
+	available := make(map[int64]struct{}, len(allowedSeqs))
+	for _, seq := range allowedSeqs {
+		available[seq] = struct{}{}
+	}
 	for i, claim := range claims {
 		if strings.TrimSpace(claim.Text) == "" {
 			return fmt.Errorf("claims[%d].text пуст", i)
@@ -285,15 +284,4 @@ func validateClaims(claims []core.ModerationClaim, transcript string) error {
 		}
 	}
 	return nil
-}
-
-func transcriptSeqs(transcript string) map[int64]struct{} {
-	seqs := make(map[int64]struct{})
-	for _, match := range transcriptSeqPattern.FindAllStringSubmatch(transcript, -1) {
-		seq, err := strconv.ParseInt(match[1], 10, 64)
-		if err == nil {
-			seqs[seq] = struct{}{}
-		}
-	}
-	return seqs
 }

@@ -2,10 +2,15 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// CurrentProtocolSchemaVersion — версия публичных событий и экспортного протокола.
+// В пределах версии поля можно только добавлять, не меняя смысл существующих.
+const CurrentProtocolSchemaVersion = 1
 
 // Agent — зарегистрированный внешний агент.
 type Agent struct {
@@ -13,6 +18,15 @@ type Agent struct {
 	Name      string    `json:"name"`
 	Persona   string    `json:"persona,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// Credential — сменяемый секрет для аутентификации стабильного Agent.
+// Сам секрет и его хэш остаются только на границе хранилища.
+type Credential struct {
+	ID        string     `json:"id"`
+	AgentID   string     `json:"agent_id"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 }
 
 // DebateMode — способ определения консенсуса.
@@ -26,6 +40,16 @@ const (
 	// и вердикт, иначе вердикт строится детерминированно по голосам.
 	ModeHybrid DebateMode = "hybrid"
 )
+
+// IsProtocolMessageKind сообщает, принадлежит ли discriminator публичной v1.
+func IsProtocolMessageKind(kind string) bool {
+	switch kind {
+	case KindArgument, KindSummary, KindVerdict, KindSystem:
+		return true
+	default:
+		return false
+	}
+}
 
 // DebateStatus — стадия жизненного цикла дебатов.
 type DebateStatus string
@@ -81,16 +105,21 @@ const (
 // Message — запись в протоколе дебатов. Support* — голос спикера:
 // чью позицию он поддерживает на момент этой реплики (режим hybrid).
 type Message struct {
-	Seq         int64     `json:"seq"`
-	DebateID    string    `json:"debate_id"`
-	Round       int       `json:"round"`
-	SpeakerID   string    `json:"speaker_id,omitempty"`
-	SpeakerName string    `json:"speaker_name"`
-	Kind        string    `json:"kind"`
-	Text        string    `json:"text"`
-	SupportID   string    `json:"support_id,omitempty"`
-	SupportName string    `json:"support_name,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	Seq          int64              `json:"seq"`
+	DebateID     string             `json:"debate_id"`
+	Round        int                `json:"round"`
+	SpeakerID    string             `json:"speaker_id,omitempty"`
+	SpeakerName  string             `json:"speaker_name"`
+	Kind         string             `json:"kind"`
+	Text         string             `json:"text"`
+	SupportID    string             `json:"support_id,omitempty"`
+	SupportName  string             `json:"support_name,omitempty"`
+	RoundSummary *RoundSummary      `json:"round_summary,omitempty"`
+	Verdict      *ModerationVerdict `json:"verdict,omitempty"`
+	// LegacyUnstructured is set only by storage when a pre-v1 summary or
+	// verdict row has prose but no durable typed payload.
+	LegacyUnstructured bool      `json:"-"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // Vote — текущий голос участника (последняя заявленная поддержка).
@@ -191,14 +220,53 @@ const (
 
 // Event — событие в дебатах для подписчиков.
 type Event struct {
-	Type      string    `json:"type"`
-	DebateID  string    `json:"debate_id"`
-	Round     int       `json:"round,omitempty"`
-	AgentID   string    `json:"agent_id,omitempty"`
-	AgentName string    `json:"agent_name,omitempty"`
-	Deadline  time.Time `json:"deadline,omitzero"`
-	Message   *Message  `json:"message,omitempty"`
-	Consensus bool      `json:"consensus,omitempty"`
+	SchemaVersion int       `json:"schema_version"`
+	Type          string    `json:"type"`
+	DebateID      string    `json:"debate_id"`
+	Round         int       `json:"round,omitempty"`
+	AgentID       string    `json:"agent_id,omitempty"`
+	AgentName     string    `json:"agent_name,omitempty"`
+	Deadline      time.Time `json:"deadline,omitzero"`
+	Message       *Message  `json:"message,omitempty"`
+	Consensus     bool      `json:"consensus,omitempty"`
+}
+
+// MarshalJSON гарантирует версию на каждом сериализованном событии, включая
+// события replay, которые создаются транспортом, а не публикуются через Hub.
+func (e Event) MarshalJSON() ([]byte, error) {
+	type wireEvent Event
+	if e.SchemaVersion == 0 {
+		e.SchemaVersion = CurrentProtocolSchemaVersion
+	}
+	if e.SchemaVersion != CurrentProtocolSchemaVersion {
+		return nil, fmt.Errorf("unsupported event schema_version %d", e.SchemaVersion)
+	}
+	if !knownEventType(e.Type) {
+		return nil, fmt.Errorf("unsupported event type %q in schema v%d", e.Type, CurrentProtocolSchemaVersion)
+	}
+	if !e.Deadline.IsZero() {
+		e.Deadline = e.Deadline.UTC()
+	}
+	if e.Message != nil {
+		message := *e.Message
+		if !IsProtocolMessageKind(message.Kind) {
+			return nil, fmt.Errorf("unsupported message kind %q in schema v%d", message.Kind, CurrentProtocolSchemaVersion)
+		}
+		if !message.CreatedAt.IsZero() {
+			message.CreatedAt = message.CreatedAt.UTC()
+		}
+		e.Message = &message
+	}
+	return json.Marshal(wireEvent(e))
+}
+
+func knownEventType(eventType string) bool {
+	switch eventType {
+	case EventJoined, EventStarted, EventTurn, EventMessage, EventSkipped, EventConcluded, EventDeleted:
+		return true
+	default:
+		return false
+	}
 }
 
 // TurnStatus — ответ на «чья сейчас очередь» для конкретного агента.
