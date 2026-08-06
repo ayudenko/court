@@ -21,8 +21,9 @@ const MaxWaitSec = 120
 
 // Server — REST-обвязка над ядром.
 type Server struct {
-	svc *core.Service
-	log *slog.Logger
+	svc               *core.Service
+	log               *slog.Logger
+	heartbeatInterval time.Duration
 }
 
 // New создаёт сервер API.
@@ -30,7 +31,7 @@ func New(svc *core.Service, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{svc: svc, log: log}
+	return &Server{svc: svc, log: log, heartbeatInterval: 25 * time.Second}
 }
 
 // Routes регистрирует маршруты API на mux.
@@ -253,43 +254,83 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("after_seq"); v != "" {
 		afterSeq, _ := strconv.ParseInt(v, 10, 64)
 		msgs, err := s.svc.Messages(debateID, afterSeq)
-		if err == nil {
-			for _, m := range msgs {
-				msg := m
-				writeSSE(w, core.Event{Type: core.EventMessage, DebateID: debateID,
-					Round: m.Round, AgentID: m.SpeakerID, AgentName: m.SpeakerName, Message: &msg})
-				seen = m.Seq
-			}
-			flusher.Flush()
+		if err != nil {
+			s.log.Error("SSE replay: чтение протокола", "debate", debateID, "err", err)
+			return
 		}
+		for _, m := range msgs {
+			msg := m
+			if err := writeSSE(w, core.Event{Type: core.EventMessage, DebateID: debateID,
+				Round: m.Round, AgentID: m.SpeakerID, AgentName: m.SpeakerName, Message: &msg}); err != nil {
+				s.logSSEError("replay", debateID, core.EventMessage, err)
+				return
+			}
+			seen = m.Seq
+		}
+		flusher.Flush()
 	}
 
-	heartbeat := time.NewTicker(25 * time.Second)
+	heartbeat := time.NewTicker(s.heartbeatInterval)
 	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:
-			fmt.Fprint(w, ": ping\n\n")
+			if err := writeSSEHeartbeat(w); err != nil {
+				s.logSSEError("heartbeat", debateID, "heartbeat", err)
+				return
+			}
 			flusher.Flush()
 		case ev := <-ch:
 			// Не дублируем сообщения, уже отданные реплеем.
 			if ev.Message != nil && ev.Message.Seq <= seen {
 				continue
 			}
-			writeSSE(w, ev)
+			if err := writeSSE(w, ev); err != nil {
+				s.logSSEError("live", debateID, ev.Type, err)
+				return
+			}
 			flusher.Flush()
 		}
 	}
 }
 
-func writeSSE(w http.ResponseWriter, ev core.Event) {
-	data, err := json.Marshal(ev)
-	if err != nil {
+func (s *Server) logSSEError(scope, debateID, eventType string, err error) {
+	var protocolErr *sseProtocolError
+	if errors.As(err, &protocolErr) {
+		s.log.Error("SSE protocol: отклонено событие", "scope", scope, "debate", debateID, "type", eventType, "err", err)
 		return
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data)
+	s.log.Warn("SSE transport: запись события", "scope", scope, "debate", debateID, "type", eventType, "err", err)
+}
+
+type sseProtocolError struct{ err error }
+
+func (e *sseProtocolError) Error() string { return "marshal SSE event: " + e.err.Error() }
+func (e *sseProtocolError) Unwrap() error { return e.err }
+
+type sseTransportError struct{ err error }
+
+func (e *sseTransportError) Error() string { return "write SSE event: " + e.err.Error() }
+func (e *sseTransportError) Unwrap() error { return e.err }
+
+func writeSSE(w http.ResponseWriter, ev core.Event) error {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return &sseProtocolError{err: err}
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data); err != nil {
+		return &sseTransportError{err: err}
+	}
+	return nil
+}
+
+func writeSSEHeartbeat(w http.ResponseWriter) error {
+	if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+		return &sseTransportError{err: err}
+	}
+	return nil
 }
 
 // --- Утилиты ---
