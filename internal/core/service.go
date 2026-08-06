@@ -72,19 +72,54 @@ type Service struct {
 	hub       *Hub
 	moderator Moderator
 	log       *slog.Logger
+	now       func() time.Time
+	newID     func(string) string
 
 	// mu сериализует переходы состояний дебатов.
 	mu chan struct{} // семафор на 1 — mutex, совместимый с context
 }
 
+// ServiceOption настраивает заменяемые источники недетерминированности.
+// Production использует криптографические ID и системные часы; record/replay
+// сценарии подменяют их, чтобы golden-трассы были побитово воспроизводимы.
+type ServiceOption func(*Service)
+
+// WithClock задаёт источник текущего времени для доменных записей и дедлайнов.
+func WithClock(now func() time.Time) ServiceOption {
+	return func(service *Service) {
+		if now != nil {
+			service.now = now
+		}
+	}
+}
+
+// WithIDGenerator задаёт генератор непрозрачных идентификаторов доменных сущностей.
+func WithIDGenerator(generator func(prefix string) string) ServiceOption {
+	return func(service *Service) {
+		if generator != nil {
+			service.newID = generator
+		}
+	}
+}
+
 // NewService собирает сервис.
-func NewService(store Storage, hub *Hub, mod Moderator, log *slog.Logger) *Service {
+func NewService(store Storage, hub *Hub, mod Moderator, log *slog.Logger, options ...ServiceOption) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Service{store: store, hub: hub, moderator: mod, log: log, mu: make(chan struct{}, 1)}
+	s := &Service{
+		store: store, hub: hub, moderator: mod, log: log,
+		now: time.Now, newID: newID, mu: make(chan struct{}, 1),
+	}
+	for _, option := range options {
+		if option != nil {
+			option(s)
+		}
+	}
 	return s
 }
+
+func (s *Service) nowUTC() time.Time { return s.now().UTC() }
 
 func (s *Service) lock()   { s.mu <- struct{}{} }
 func (s *Service) unlock() { <-s.mu }
@@ -130,7 +165,7 @@ func (s *Service) expireTurns(ctx context.Context) {
 		s.log.Error("проверка дедлайнов", "err", err)
 		return
 	}
-	now := time.Now().UTC()
+	now := s.nowUTC()
 	for _, d := range debates {
 		if d.Status == StatusPreparing && !d.TurnDeadline.After(now) {
 			parts, err := s.store.Participants(d.ID)
@@ -178,9 +213,9 @@ func (s *Service) RegisterAgent(name, persona string) (Agent, string, error) {
 	if len(persona) > 2000 {
 		return Agent{}, "", fmt.Errorf("%w: persona до 2000 символов", ErrValidation)
 	}
-	agent := Agent{ID: newID("agt"), Name: name, Persona: persona, CreatedAt: time.Now().UTC()}
+	agent := Agent{ID: s.newID("agt"), Name: name, Persona: persona, CreatedAt: s.nowUTC()}
 	key := "ck_" + randHex(32)
-	credential := Credential{ID: newID("crd"), AgentID: agent.ID, CreatedAt: agent.CreatedAt}
+	credential := Credential{ID: s.newID("crd"), AgentID: agent.ID, CreatedAt: agent.CreatedAt}
 	if err := s.store.CreateAgent(agent, credential, hashKey(key)); err != nil {
 		return Agent{}, "", err
 	}
@@ -258,7 +293,7 @@ func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView,
 		return DebateView{}, fmt.Errorf("%w: prep_time_sec от 0 до %d секунд", ErrValidation, MaxPrepTime)
 	}
 	d := Debate{
-		ID:          newID("dbt"),
+		ID:          s.newID("dbt"),
 		Question:    question,
 		Description: description,
 		Mode:        mode,
@@ -267,7 +302,7 @@ func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView,
 		TurnTimeout: turnTimeoutSec,
 		PrepTime:    p.PrepTimeSec,
 		CreatorID:   creator.ID,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   s.nowUTC(),
 	}
 	s.lock()
 	defer s.unlock()
@@ -275,7 +310,7 @@ func (s *Service) CreateDebate(creator Agent, p CreateDebateParams) (DebateView,
 		return DebateView{}, err
 	}
 	if !p.Observer {
-		if err := s.store.AddParticipant(d.ID, creator.ID, p.Stance, time.Now().UTC()); err != nil {
+		if err := s.store.AddParticipant(d.ID, creator.ID, p.Stance, s.nowUTC()); err != nil {
 			return DebateView{}, err
 		}
 	}
@@ -313,7 +348,7 @@ func (s *Service) JoinDebate(agent Agent, debateID, stance string) (DebateView, 
 			return DebateView{}, fmt.Errorf("%w: вы уже участвуете", ErrBadState)
 		}
 	}
-	if err := s.store.AddParticipant(debateID, agent.ID, stance, time.Now().UTC()); err != nil {
+	if err := s.store.AddParticipant(debateID, agent.ID, stance, s.nowUTC()); err != nil {
 		return DebateView{}, err
 	}
 	s.hub.Publish(Event{Type: EventJoined, DebateID: debateID, AgentID: agent.ID, AgentName: agent.Name})
@@ -345,7 +380,7 @@ func (s *Service) StartDebate(agent Agent, debateID string) (DebateView, error) 
 		// Фаза подготовки: участники изучают материалы, ходов нет.
 		d.Status = StatusPreparing
 		d.TurnAgentID = ""
-		d.TurnDeadline = time.Now().UTC().Add(time.Duration(d.PrepTime) * time.Second)
+		d.TurnDeadline = s.nowUTC().Add(time.Duration(d.PrepTime) * time.Second)
 		if err := s.store.UpdateDebate(d); err != nil {
 			return DebateView{}, err
 		}
@@ -383,7 +418,7 @@ func (s *Service) beginFirstRound(d *Debate, parts []Participant) error {
 	d.Status = StatusRunning
 	d.CurrentRound = 1
 	d.TurnAgentID = parts[0].AgentID
-	d.TurnDeadline = time.Now().UTC().Add(time.Duration(d.TurnTimeout) * time.Second)
+	d.TurnDeadline = s.nowUTC().Add(time.Duration(d.TurnTimeout) * time.Second)
 	if err := s.store.UpdateDebate(*d); err != nil {
 		return err
 	}
@@ -456,7 +491,7 @@ func (s *Service) advanceTurn(ctx context.Context, d Debate) error {
 	if idx >= 0 && idx+1 < len(parts) {
 		next := parts[idx+1]
 		d.TurnAgentID = next.AgentID
-		d.TurnDeadline = time.Now().UTC().Add(time.Duration(d.TurnTimeout) * time.Second)
+		d.TurnDeadline = s.nowUTC().Add(time.Duration(d.TurnTimeout) * time.Second)
 		if err := s.store.UpdateDebate(d); err != nil {
 			return err
 		}
@@ -582,7 +617,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	d.Status = StatusRunning
 	d.CurrentRound++
 	d.TurnAgentID = parts[0].AgentID
-	d.TurnDeadline = time.Now().UTC().Add(time.Duration(d.TurnTimeout) * time.Second)
+	d.TurnDeadline = s.nowUTC().Add(time.Duration(d.TurnTimeout) * time.Second)
 	if err := s.store.UpdateDebate(d); err != nil {
 		s.log.Error("модерация: сохранение раунда", "debate", debateID, "err", err)
 		return
@@ -637,7 +672,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		d.Status = StatusRunning
 		d.CurrentRound++
 		d.TurnAgentID = parts[0].AgentID
-		d.TurnDeadline = time.Now().UTC().Add(time.Duration(d.TurnTimeout) * time.Second)
+		d.TurnDeadline = s.nowUTC().Add(time.Duration(d.TurnTimeout) * time.Second)
 		if err := s.store.UpdateDebate(d); err != nil {
 			s.log.Error("гибрид: сохранение раунда", "debate", d.ID, "err", err)
 			return
@@ -792,7 +827,7 @@ func (s *Service) appendArgument(debateID string, round int, agent Agent, text, 
 		Text:        text,
 		SupportID:   supportID,
 		SupportName: supportName,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   s.nowUTC(),
 	}
 	seq, err := s.store.AddMessage(m)
 	if err != nil {
@@ -814,7 +849,7 @@ func (s *Service) appendMessage(debateID string, round int, speakerID, speakerNa
 		SpeakerName: speakerName,
 		Kind:        kind,
 		Text:        text,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   s.nowUTC(),
 	}
 	return s.appendProtocolMessage(m)
 }
@@ -829,7 +864,7 @@ func (s *Service) appendSummary(debateID string, round int, speakerName string, 
 		Kind:         KindSummary,
 		Text:         summary.Text(),
 		RoundSummary: &summary,
-		CreatedAt:    time.Now().UTC(),
+		CreatedAt:    s.nowUTC(),
 	}
 	return s.appendProtocolMessage(m)
 }
@@ -853,7 +888,7 @@ func (s *Service) appendVerdictText(
 		Kind:        KindVerdict,
 		Text:        text,
 		Verdict:     &verdict,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   s.nowUTC(),
 	}
 	return s.appendProtocolMessage(m)
 }
@@ -954,7 +989,7 @@ func (s *Service) TurnStatus(agent Agent, debateID string) (TurnStatus, error) {
 	}
 	// Дедлайн: в running — конец хода, в preparing — момент старта раунда 1.
 	if !d.TurnDeadline.IsZero() {
-		st.DeadlineSec = max(0, int(time.Until(d.TurnDeadline).Seconds()))
+		st.DeadlineSec = max(0, int(d.TurnDeadline.Sub(s.nowUTC()).Seconds()))
 	}
 	return st, nil
 }

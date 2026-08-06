@@ -291,6 +291,41 @@ func TestAuthenticateAcceptsRegisteredCredential(t *testing.T) {
 	}
 }
 
+func TestTurnStatusUsesInjectedClock(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	service := newTestServiceWithOptions(t, consensusModerator{}, core.WithClock(func() time.Time { return now }))
+	creator := registerAgent(t, service, "creator")
+	challenger := registerAgent(t, service, "challenger")
+	created, err := service.CreateDebate(creator, core.CreateDebateParams{
+		Question: "Does the deadline follow the injected clock?", TurnTimeoutSec: core.MinTurnTimeout,
+	})
+	if err != nil {
+		t.Fatalf("CreateDebate: %v", err)
+	}
+	if _, err := service.JoinDebate(challenger, created.ID, "verify"); err != nil {
+		t.Fatalf("JoinDebate: %v", err)
+	}
+	if _, err := service.StartDebate(creator, created.ID); err != nil {
+		t.Fatalf("StartDebate: %v", err)
+	}
+
+	status, err := service.TurnStatus(creator, created.ID)
+	if err != nil {
+		t.Fatalf("TurnStatus: %v", err)
+	}
+	if status.DeadlineSec != core.MinTurnTimeout {
+		t.Fatalf("initial deadline = %d, want %d", status.DeadlineSec, core.MinTurnTimeout)
+	}
+	now = now.Add(7 * time.Second)
+	status, err = service.TurnStatus(creator, created.ID)
+	if err != nil {
+		t.Fatalf("TurnStatus after clock advance: %v", err)
+	}
+	if status.DeadlineSec != core.MinTurnTimeout-7 {
+		t.Fatalf("advanced deadline = %d, want %d", status.DeadlineSec, core.MinTurnTimeout-7)
+	}
+}
+
 func TestHybridVerdictConsensusFollowsVotesNotModerator(t *testing.T) {
 	service := newTestService(t)
 	creator := registerAgent(t, service, "creator")
@@ -701,6 +736,10 @@ func newTestService(t *testing.T) *core.Service {
 }
 
 func newTestServiceWithModerator(t *testing.T, mod core.Moderator) *core.Service {
+	return newTestServiceWithOptions(t, mod)
+}
+
+func newTestServiceWithOptions(t *testing.T, mod core.Moderator, options ...core.ServiceOption) *core.Service {
 	t.Helper()
 	database, err := store.Open(filepath.Join(t.TempDir(), "court.db"))
 	if err != nil {
@@ -712,7 +751,7 @@ func newTestServiceWithModerator(t *testing.T, mod core.Moderator) *core.Service
 		}
 	})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return core.NewService(database, core.NewHub(), mod, logger)
+	return core.NewService(database, core.NewHub(), mod, logger, options...)
 }
 
 func registerAgent(t *testing.T, service *core.Service, name string) core.Agent {
