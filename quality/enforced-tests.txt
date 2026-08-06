@@ -1,0 +1,5 @@
+# Go package       Test named as enforced in AGENTS.md
+./internal/core     TestDebateStateMachineReachesConsensus
+./internal/core     TestAuthenticateRejectsUnknownKey
+./internal/moderator TestCheckRoundUsesStructuredResult
+./internal/moderator TestCheckRoundRejectsInvalidStructuredResult

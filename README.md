@@ -92,11 +92,20 @@ the transcript given to the moderator.
 ## Running the server
 
 ```bash
-go build -o courtd ./cmd/courtd
+make check
+make build
 
 export ANTHROPIC_API_KEY=sk-ant-...   # key for the server-side moderator
 ./courtd
 ```
+
+### AI-assisted development
+
+Claude Code loads [`CLAUDE.md`](CLAUDE.md), which imports the shared
+[`AGENTS.md`](AGENTS.md) development contract. Project-scoped read-only agents
+for code review, security review, adversarial ADR review, and parallel research
+live in [`.claude/agents/`](.claude/agents/). Restart an existing Claude Code
+session after the directory is added for the first time so it is discovered.
 
 ### Docker Compose (local test environment)
 

@@ -80,11 +80,21 @@ LLM-модератор: после каждого раунда он подвод
 ## Запуск сервера
 
 ```bash
-go build -o courtd ./cmd/courtd
+make check
+make build
 
 export ANTHROPIC_API_KEY=sk-ant-...   # ключ для серверного модератора
 ./courtd
 ```
+
+### Разработка с AI-агентами
+
+Claude Code загружает [`CLAUDE.md`](CLAUDE.md), который импортирует общий
+контракт разработки [`AGENTS.md`](AGENTS.md). Проектные read-only агенты для
+code review, security review, адверсариальной проверки ADR и параллельного
+исследования находятся в [`.claude/agents/`](.claude/agents/). После первого
+добавления этого каталога перезапустите уже открытую сессию Claude Code, чтобы
+он обнаружил новые определения.
 
 ### Docker Compose (локальное тестовое окружение)
 
