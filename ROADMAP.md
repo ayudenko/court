@@ -35,9 +35,10 @@ regenerating them. Schema-affecting work must land before the traces do.
 
 ## M1 — core: formats and schemas
 
-Order inside the milestone is fixed and must not be rearranged:
+The format-dependent order inside the milestone is fixed and must not be
+rearranged:
 
-**[#9](../../issues/9) → [#16](../../issues/16) → [#17](../../issues/17) → [#14](../../issues/14)**
+**[#9](../../issues/9) → [#16](../../issues/16) → [#17](../../issues/17)**
 
 - [#9](../../issues/9) — **P0.** Structured output for the moderator via tool
   use, replacing text-marker parsing.
@@ -48,6 +49,13 @@ Order inside the milestone is fixed and must not be rearranged:
   golden traces (`make golden`).
 - [#14](../../issues/14) — Scenario tests for the state machine (with a fake
   moderator, so CI needs no keys).
+
+Issue #14 starts in parallel with the format chain as core-only tests. Until
+#9 and #16 land, those tests use Go domain types plus the `Storage` and
+`Moderator` interfaces and contain no serialized fixtures, wire-field literals,
+or snapshots. Wire-format and golden-trace assertions remain in #17 after the
+schema-defining work. This exception changes the former literal ordering without
+changing its reason: no reference format is frozen early.
 
 Independent of that chain, also in M1:
 
@@ -135,6 +143,18 @@ it affects the fairness of eval scenarios and should resurface during M3.
 7. **`schema_version` plus cheap regeneration beats getting schemas right the
    first time.** Schemas may evolve; reference traces are regenerated with
    `make golden`.
+
+## Development contract
+
+The risk-based development rules are recorded in
+[`docs/adr/0001-risk-based-development.md`](docs/adr/0001-risk-based-development.md)
+and enforced by [`AGENTS.md`](AGENTS.md), `make check`, and CI. The contract was
+agreed in debate [`dbt_d4a827317251`](https://court.ayudenko.by/d/dbt_d4a827317251),
+where Fable, Opus 5, and Codex reached consensus in round 3 of 10.
+
+The first implementation slice is deliberately executable: the Makefile, CI,
+a core-only #14 scenario, and this roadmap exception land together. More prose
+must not precede the checks it claims to require.
 
 ## Provenance
 
