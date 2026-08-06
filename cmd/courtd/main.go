@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,7 +47,11 @@ func main() {
 		log.Error("открытие хранилища", "err", err)
 		os.Exit(1)
 	}
-	defer st.Close()
+	defer func() {
+		if err := st.Close(); err != nil {
+			log.Error("закрытие хранилища", "err", err)
+		}
+	}()
 
 	mod, err := buildModerator(log)
 	if err != nil {
@@ -87,27 +92,31 @@ func main() {
 		}
 		base := scheme + "://" + r.Host
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-		fmt.Fprintf(w, "# Приглашение в дебаты\n\n")
-		fmt.Fprintf(w, "Тебя пригласили участвовать в дебатах AI-агентов.\n\n")
-		fmt.Fprintf(w, "- **Вопрос:** %s\n", d.Question)
-		fmt.Fprintf(w, "- **ID дебатов:** `%s`\n", d.ID)
-		fmt.Fprintf(w, "- **Режим:** %s, раундов: %d, таймаут хода: %d сек\n", d.Mode, d.Rounds, d.TurnTimeout)
-		fmt.Fprintf(w, "- **Сервер:** %s (REST — `%s/api`, MCP — `%s/mcp`)\n\n", base, base, base)
+		var invite strings.Builder
+		fmt.Fprintf(&invite, "# Приглашение в дебаты\n\n")
+		fmt.Fprintf(&invite, "Тебя пригласили участвовать в дебатах AI-агентов.\n\n")
+		fmt.Fprintf(&invite, "- **Вопрос:** %s\n", d.Question)
+		fmt.Fprintf(&invite, "- **ID дебатов:** `%s`\n", d.ID)
+		fmt.Fprintf(&invite, "- **Режим:** %s, раундов: %d, таймаут хода: %d сек\n", d.Mode, d.Rounds, d.TurnTimeout)
+		fmt.Fprintf(&invite, "- **Сервер:** %s (REST — `%s/api`, MCP — `%s/mcp`)\n\n", base, base, base)
 		if d.Description != "" {
-			fmt.Fprintf(w, "**Контекст дискуссии:**\n\n%s\n\n", d.Description)
+			fmt.Fprintf(&invite, "**Контекст дискуссии:**\n\n%s\n\n", d.Description)
 		}
 		if d.Status != core.StatusOpen {
-			fmt.Fprintf(w, "⚠ Дебаты сейчас в статусе `%s` — присоединиться можно только к открытым (`open`). "+
+			fmt.Fprintf(&invite, "⚠ Дебаты сейчас в статусе `%s` — присоединиться можно только к открытым (`open`). "+
 				"Сообщи об этом пользователю.\n\n", d.Status)
 		} else {
-			fmt.Fprintf(w, "Действуй по инструкции ниже: зарегистрируйся (если у тебя ещё нет ключа), "+
+			fmt.Fprintf(&invite, "Действуй по инструкции ниже: зарегистрируйся (если у тебя ещё нет ключа), "+
 				"присоединись к дебатам `%s` (`join_debate` или `POST %s/api/debates/%s/join`) "+
 				"и участвуй до вердикта.\n\n", d.ID, base, d.ID)
-			fmt.Fprintf(w, "Контекст дискуссии (если создатель его задал) раскрывается со старта дебатов: "+
+			fmt.Fprintf(&invite, "Контекст дискуссии (если создатель его задал) раскрывается со старта дебатов: "+
 				"забери его через `get_debate` в фазе подготовки, до этого он скрыт.\n\n")
 		}
-		fmt.Fprintf(w, "---\n\n")
-		_, _ = w.Write(skills.CourtDebater)
+		fmt.Fprintf(&invite, "---\n\n")
+		invite.Write(skills.CourtDebater)
+		if _, err := w.Write([]byte(invite.String())); err != nil {
+			log.Warn("запись приглашения", "debate_id", d.ID, "err", err)
+		}
 	})
 
 	server := &http.Server{

@@ -1,6 +1,8 @@
-.PHONY: build check fmt fmt-check golden matrix-check scenario-boundary-check test test-race vet
+.PHONY: build check fmt fmt-check golden lint lint-install matrix-check scenario-boundary-check test test-race vet
 
 GO_DIRS := cmd internal skills
+GOLANGCI_LINT ?= golangci-lint
+GOLANGCI_LINT_VERSION := $(shell cat .golangci-lint-version)
 MATRIX_DOC := AGENTS.md
 ENFORCED_TESTS := quality/enforced-tests.txt
 
@@ -23,6 +25,16 @@ fmt-check:
 
 vet:
 	go vet ./...
+
+lint:
+	@command -v $(GOLANGCI_LINT) >/dev/null 2>&1 || { \
+		echo "golangci-lint $(GOLANGCI_LINT_VERSION) is required; run 'make lint-install'."; \
+		exit 1; \
+	}
+	$(GOLANGCI_LINT) run ./...
+
+lint-install:
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 scenario-boundary-check:
 	@status=0; \
@@ -59,4 +71,4 @@ test:
 test-race:
 	go test -race ./...
 
-check: fmt-check scenario-boundary-check matrix-check vet test
+check: fmt-check scenario-boundary-check matrix-check vet lint test
