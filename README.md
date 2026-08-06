@@ -101,11 +101,17 @@ export ANTHROPIC_API_KEY=sk-ant-...   # key for the server-side moderator
 
 ### AI-assisted development
 
-Claude Code loads [`CLAUDE.md`](CLAUDE.md), which imports the shared
-[`AGENTS.md`](AGENTS.md) development contract. Project-scoped read-only agents
-for code review, security review, adversarial ADR review, and parallel research
-live in [`.claude/agents/`](.claude/agents/). Restart an existing Claude Code
-session after the directory is added for the first time so it is discovered.
+Codex loads the shared [`AGENTS.md`](AGENTS.md) development contract natively;
+its project settings and agents configured read-only by default live in
+[`.codex/`](.codex/). After cloning, accept Codex's project-trust prompt and
+start a new session so this project-scoped configuration is loaded. Claude Code
+loads [`CLAUDE.md`](CLAUDE.md), which imports the same contract, and uses the
+equivalent agents in [`.claude/agents/`](.claude/agents/). Both integrations
+provide independent code and security review, adversarial ADR review, and
+parallel read-only research. Start a new Claude Code session after its agent
+directory is added for the first time. Codex review agents are read-only by
+default; do not launch them from a permissive parent permission mode, whose
+live overrides take precedence.
 
 ### Docker Compose (local test environment)
 

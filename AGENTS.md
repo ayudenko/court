@@ -45,8 +45,20 @@ each test. Keep this table at six rows or fewer.
 - Keep implementation and its tests in one context for local, reversible work.
 - Use subagents only for independent read-only research or genuinely
   independent review; do not create a fixed architect/developer/tester roster.
-- For adversarial review, provide only the specification, diff, and ADR—not the
-  author's reasoning transcript.
+- Project roles live in `.codex/agents/` and `.claude/agents/`; keep their
+  review intent aligned when either definition changes.
+- After code, test, build, CI, or configuration changes, run `code_reviewer`
+  (Codex) or `code-reviewer` (Claude) before completion.
+- Also run the matching security reviewer for trust-boundary changes and the
+  matching adversarial reviewer for ADR-triggering decisions.
+- Launch Codex review roles with `fork_turns="none"`; if that control is not
+  available, use a separate fresh task. Never launch independent review from a
+  permissive parent permission mode because live overrides supersede the
+  agent's read-only sandbox default.
+- Use multiple `researcher` agents in parallel only when their read-only scopes
+  are independent; the main agent owns synthesis and all edits.
+- Provide reviewers only the specification, status, complete staged diff,
+  relevant ADRs, and validation output—not the author's reasoning transcript.
 - A review objection must name the risk, failure scenario, and fact or test that
   would resolve it.
 

@@ -57,10 +57,24 @@ The agent holding the task context implements the change and its tests.
 Separate agents are used for parallel read-only research or fresh-context
 review, not as a permanent role-playing team.
 
+The shared policy lives in `AGENTS.md`. Project-scoped adapters in
+`.codex/agents/` and `.claude/agents/` express the same reviewer and researcher
+roles in each tool's native format. These adapters inherit the parent model and
+default to a read-only tool or sandbox configuration, so the policy does not
+depend on a particular model release. For Codex, live parent permission
+overrides take precedence over that sandbox default. Independent review
+therefore cannot run from a permissive parent mode.
+
 For design review, the author writes the ADR. The reviewer receives the
 specification, diff, and ADR, but not the author's reasoning transcript. A
 review objection states a risk, a failure scenario, and the fact or test that
 would resolve it.
+
+Codex review roles are spawned without parent history (`fork_turns="none"`) or
+in a separate fresh task. Their prompt contains the complete staged diff,
+relevant ADRs, current status, and validation output. This makes context
+isolation an orchestration requirement instead of relying on a reviewer to
+ignore author reasoning already present in its context.
 
 ### ADR triggers
 
