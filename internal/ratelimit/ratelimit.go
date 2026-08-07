@@ -57,11 +57,13 @@ const (
 // caller's own doing or the shared address budget, which is the difference
 // between a client bug and a reason to raise the limits.
 const (
-	ScopeRegistration  = "регистрация агентов с этого адреса"
-	ScopeDebateByAgent = "создание дебатов этим агентом"
-	ScopeDebateByIP    = "создание дебатов с этого адреса"
-	ScopeStreamByAgent = "одновременные подключения этого агента"
-	ScopeStreamByIP    = "одновременные подключения с этого адреса"
+	ScopeRegistration      = "регистрация агентов с этого адреса"
+	ScopeDebateByAgent     = "создание дебатов этим агентом"
+	ScopeDebateByIP        = "создание дебатов с этого адреса"
+	ScopeCredentialByAgent = "выпуск ключей этим агентом"
+	ScopeCredentialByIP    = "выпуск ключей с этого адреса"
+	ScopeStreamByAgent     = "одновременные подключения этого агента"
+	ScopeStreamByIP        = "одновременные подключения с этого адреса"
 )
 
 // Config holds the operator-visible limits. Its zero value disables everything.
@@ -77,6 +79,15 @@ type Config struct {
 	// agents a caller has accumulated over time; only the address bound keeps
 	// total debate creation — and therefore total moderator spend — finite.
 	DebatesPerHourPerIP int
+	// CredentialsPerHourPerAgent limits credential issuance, an authenticated
+	// write that creates durable rows. The active-credential cap in the core
+	// bounds how many secrets work at once; this bounds how fast revoked rows
+	// accumulate.
+	CredentialsPerHourPerAgent int
+	// CredentialsPerHourPerIP bounds the same operation by address, for the
+	// reason DebatesPerHourPerIP exists: an agent-keyed budget alone grows with
+	// the number of agents one caller has accumulated.
+	CredentialsPerHourPerIP int
 	// StreamsPerClient caps concurrent long-poll, SSE, and /mcp requests. It is
 	// applied to the agent and to the address independently: an agent-only cap
 	// would let one address add another StreamsPerClient slots per registered
@@ -147,6 +158,8 @@ type Limiter struct {
 	registrations  *bucketTable
 	debatesByAgent *bucketTable
 	debatesByIP    *bucketTable
+	credsByAgent   *bucketTable
+	credsByIP      *bucketTable
 	streams        *streamTable
 }
 
@@ -178,6 +191,8 @@ func New(cfg Config, options ...Option) *Limiter {
 		registrations:  newBucketTable(ScopeRegistration, cfg.RegistrationsPerHourPerIP, maxTracked),
 		debatesByAgent: newBucketTable(ScopeDebateByAgent, cfg.DebatesPerHourPerAgent, maxTracked),
 		debatesByIP:    newBucketTable(ScopeDebateByIP, cfg.DebatesPerHourPerIP, maxTracked),
+		credsByAgent:   newBucketTable(ScopeCredentialByAgent, cfg.CredentialsPerHourPerAgent, maxTracked),
+		credsByIP:      newBucketTable(ScopeCredentialByIP, cfg.CredentialsPerHourPerIP, maxTracked),
 		streams:        newStreamTable(cfg.StreamsPerClient),
 	}
 	for _, option := range options {
@@ -204,6 +219,17 @@ func (l *Limiter) AllowDebateCreation(agentID, clientIP string) (Grant, error) {
 	}
 	return l.spend(map[string]string{"agent": agentID, "ip": clientIP},
 		bucketFor(l.debatesByAgent, agentID), bucketFor(l.debatesByIP, clientIP))
+}
+
+// AllowCredentialIssue accounts one credential issued by agentID from clientIP.
+// The agent key is the stable agent rather than the presenting credential, so
+// rotating or holding several keys never multiplies the budget.
+func (l *Limiter) AllowCredentialIssue(agentID, clientIP string) (Grant, error) {
+	if l == nil {
+		return Grant{}, nil
+	}
+	return l.spend(map[string]string{"agent": agentID, "ip": clientIP},
+		bucketFor(l.credsByAgent, agentID), bucketFor(l.credsByIP, clientIP))
 }
 
 // spend charges every bucket or none: a request refused by a later bucket must

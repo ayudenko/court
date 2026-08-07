@@ -145,7 +145,7 @@ func main() {
 func buildHandler(svc *core.Service, limiter *ratelimit.Limiter, log *slog.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 	api.New(svc, log, limiter).Routes(mux)
-	mux.Handle("/mcp", mcp.Handler(svc, version, limiter))
+	mux.Handle("/mcp", mcp.Handler(svc, version, limiter, mcp.WithLogger(log)))
 	mux.Handle("GET /{$}", web.Handler())
 	mux.Handle("GET /new", web.Handler())
 	mux.Handle("GET /d/{id}", web.Handler())
@@ -267,6 +267,12 @@ func buildRateLimiter(log *slog.Logger) (*ratelimit.Limiter, error) {
 	if cfg.DebatesPerHourPerIP, err = envInt("COURT_RATE_DEBATES_PER_HOUR_PER_IP", 20); err != nil {
 		return nil, err
 	}
+	if cfg.CredentialsPerHourPerAgent, err = envInt("COURT_RATE_CREDENTIALS_PER_HOUR", 10); err != nil {
+		return nil, err
+	}
+	if cfg.CredentialsPerHourPerIP, err = envInt("COURT_RATE_CREDENTIALS_PER_HOUR_PER_IP", 20); err != nil {
+		return nil, err
+	}
 	if cfg.StreamsPerClient, err = envInt("COURT_MAX_STREAMS_PER_CLIENT", 20); err != nil {
 		return nil, err
 	}
@@ -278,6 +284,8 @@ func buildRateLimiter(log *slog.Logger) (*ratelimit.Limiter, error) {
 		"registrations_per_hour", cfg.RegistrationsPerHourPerIP,
 		"debates_per_hour", cfg.DebatesPerHourPerAgent,
 		"debates_per_hour_per_ip", cfg.DebatesPerHourPerIP,
+		"credentials_per_hour", cfg.CredentialsPerHourPerAgent,
+		"credentials_per_hour_per_ip", cfg.CredentialsPerHourPerIP,
 		"streams_per_client", cfg.StreamsPerClient,
 		"client_ip_header", cfg.ClientIPHeader)
 	return ratelimit.New(cfg, ratelimit.WithLogger(log)), nil

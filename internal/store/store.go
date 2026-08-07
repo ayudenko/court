@@ -17,6 +17,20 @@ import (
 // ErrNotFound возвращается, когда запись не найдена.
 var ErrNotFound = errors.New("не найдено")
 
+// ErrLastCredential — попытка отозвать единственный действующий ключ агента.
+// У идентичности агента нет владельческого аккаунта и канала восстановления,
+// поэтому отзыв последнего ключа уничтожил бы её навсегда.
+// См. docs/adr/0005-credential-rotation-and-revocation.md.
+var ErrLastCredential = errors.New("нельзя отозвать последний действующий ключ: выпустите новый, затем отзовите этот")
+
+// ErrTooManyCredentials — исчерпан потолок одновременно действующих ключей.
+var ErrTooManyCredentials = errors.New("слишком много действующих ключей")
+
+// revokedShadowPrefix помечает откатную тень agents.api_key_hash как
+// нерабочую. Значение не может совпасть с настоящим хэшем: hashKey отдаёт
+// hex-SHA-256, в котором двоеточия не бывает.
+const revokedShadowPrefix = "revoked:"
+
 // currentModerationSchemaVersion evolves independently from the public SSE and
 // JSONL protocol version so persisted v1 evidence remains readable after a
 // future public protocol bump.
@@ -118,15 +132,19 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("проверка legacy-схемы credentials: %w", err)
 	}
 	if hasAgentKeyHashShadow {
+		// Надгробие отозванного ключа (ADR 0005) — не секрет и не подлежит
+		// обратному копированию: иначе каждый рестарт воскрешал бы отозванный
+		// ключ как новую действующую строку credentials.
+		tombstoned := revokedShadowPrefix + "%"
 		if _, err := db.Exec(`
 			INSERT INTO agent_credentials (id, agent_id, key_hash, created_at)
 			SELECT 'crd_legacy_' || id, id, api_key_hash, created_at
 			FROM agents a
-			WHERE api_key_hash <> ''
+			WHERE api_key_hash <> '' AND api_key_hash NOT LIKE ?
 			  AND NOT EXISTS (
 				SELECT 1 FROM agent_credentials c WHERE c.key_hash = a.api_key_hash
 			  )
-		`); err != nil {
+		`, tombstoned); err != nil {
 			return nil, fmt.Errorf("миграция legacy credentials: %w", err)
 		}
 		var missing int
@@ -135,8 +153,8 @@ func Open(path string) (*Store, error) {
 			FROM agents a
 			LEFT JOIN agent_credentials c
 			  ON c.key_hash = a.api_key_hash AND c.agent_id = a.id
-			WHERE a.api_key_hash <> '' AND c.id IS NULL
-		`).Scan(&missing); err != nil {
+			WHERE a.api_key_hash <> '' AND a.api_key_hash NOT LIKE ? AND c.id IS NULL
+		`, tombstoned).Scan(&missing); err != nil {
 			return nil, fmt.Errorf("проверка legacy credentials: %w", err)
 		}
 		if missing != 0 {
@@ -186,29 +204,174 @@ func (s *Store) CreateAgent(a core.Agent, credential core.Credential, keyHash st
 }
 
 // CreateCredential добавляет ещё один независимо отзываемый ключ агента.
-func (s *Store) CreateCredential(credential core.Credential, keyHash string) error {
+// Потолок maxActive (0 — без потолка) проверяется в той же транзакции, что и
+// вставка: счёт снаружи транзакции гонка превратила бы в необязательный.
+// Тень agents.api_key_hash намеренно не обновляется — в неё пишет только
+// регистрация, иначе откатный бинарь получил бы произвольное подмножество
+// ключей агента (ADR 0005).
+func (s *Store) CreateCredential(credential core.Credential, keyHash string, maxActive int) error {
 	if credential.ID == "" || credential.AgentID == "" || keyHash == "" {
 		return errors.New("неполный credential")
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO agent_credentials (id, agent_id, key_hash, created_at, revoked_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		credential.ID, credential.AgentID, keyHash, credential.CreatedAt, nullTimePtr(credential.RevokedAt),
-	)
-	return err
-}
-
-// RevokeCredential запрещает дальнейшую аутентификацию по credential.
-func (s *Store) RevokeCredential(id string, at time.Time) error {
-	res, err := s.db.Exec(
-		`UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, at, id)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer func() { _ = tx.Rollback() }()
+	if maxActive > 0 {
+		var active int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM agent_credentials WHERE agent_id = ? AND revoked_at IS NULL`,
+			credential.AgentID,
+		).Scan(&active); err != nil {
+			return err
+		}
+		if active >= maxActive {
+			return fmt.Errorf("%w: не больше %d", ErrTooManyCredentials, maxActive)
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO agent_credentials (id, agent_id, key_hash, created_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		credential.ID, credential.AgentID, keyHash, credential.CreatedAt, nullTimePtr(credential.RevokedAt),
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MaxListedCredentials ограничивает выдачу списка ключей. Отозванные строки не
+// удаляются и накапливаются со скоростью лимита выпуска, поэтому без потолка
+// дешёвый аутентифицированный запрос превращается в сканирование и
+// сериализацию всей истории агента на единственном соединении к SQLite.
+const MaxListedCredentials = 100
+
+// Обрезание списка допустимо только для истории: владелец обязан видеть каждый
+// действующий ключ, иначе утёкший ключ становится неотзываемым — идентификатор
+// credential больше нигде не показывается, и запрос на отзыв не из чего
+// составить. Свойство держится на соотношении двух констант из разных пакетов,
+// поэтому оно проверяется компилятором: если действующих ключей может стать
+// больше, чем помещается в выдачу, разность станет отрицательной и сборка
+// упадёт здесь, а не молча в проде.
+const _ = uint(MaxListedCredentials - core.MaxActiveCredentials)
+
+// Credentials отдаёт ключи агента, включая отозванные: владельцу нужно видеть,
+// что именно он отозвал и когда. Хэши за границу хранилища не выходят.
+//
+// Порядок — сначала действующие, потом отозванные от новых к старым. Он важен
+// вместе с потолком: действующих не больше MaxActiveCredentials, поэтому
+// обрезается только история, и владелец никогда не теряет из виду ключ, который
+// ещё можно отозвать.
+func (s *Store) Credentials(agentID string) (_ []core.Credential, err error) {
+	rows, err := s.db.Query(`
+		SELECT id, agent_id, created_at, revoked_at
+		FROM agent_credentials WHERE agent_id = ?
+		ORDER BY (revoked_at IS NOT NULL), created_at DESC, id DESC
+		LIMIT ?`, agentID, MaxListedCredentials)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	var list []core.Credential
+	for rows.Next() {
+		var c core.Credential
+		var revokedAt sql.NullTime
+		if err := rows.Scan(&c.ID, &c.AgentID, &c.CreatedAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		if revokedAt.Valid {
+			t := revokedAt.Time.UTC()
+			c.RevokedAt = &t
+		}
+		c.CreatedAt = c.CreatedAt.UTC()
+		list = append(list, c)
+	}
+	return list, rows.Err()
+}
+
+// RevokeCredential запрещает дальнейшую аутентификацию по ключу агента.
+//
+// Владение проверяется в самом UPDATE: чужой, несуществующий и уже отозванный
+// id одинаково дают ErrNotFound, чтобы эндпоинт не работал оракулом
+// существования непринадлежащих идентификаторов.
+//
+// Если отзывается ключ, продублированный в откатную тень agents.api_key_hash,
+// надгробие пишется и в тень, и в key_hash самой строки credentials. Оба места
+// обязательны, и по разным причинам:
+//
+//   - тень: пре-0002 бинарь аутентифицируется по ней напрямую, и без надгробия
+//     откат молча воскресил бы отозванный секрет;
+//   - key_hash: догоняющая миграция бинаря ADR 0002 копирует тень обратно в
+//     agent_credentials, пропуская лишь строки, чей хэш там уже есть. Совпадение
+//     значений — единственное, что заставляет её пропустить надгробие. Иначе на
+//     legacy-базе она падает на конфликте первичного ключа (бинарь не стартует),
+//     а на свежей создаёт фантомный действующий ключ, который никто не выпускал
+//     и который обходит правило последнего ключа.
+//
+// Настоящий хэш при этом теряется, и это правильно: отозванный ключ не секрет,
+// а совпасть со случайным 128-битным ключом он не может.
+// См. docs/adr/0005-credential-rotation-and-revocation.md.
+func (s *Store) RevokeCredential(agentID, id string, at time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var active int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM agent_credentials WHERE agent_id = ? AND revoked_at IS NULL`,
+		agentID,
+	).Scan(&active); err != nil {
+		return err
+	}
+	var isActiveTarget bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM agent_credentials
+		 WHERE id = ? AND agent_id = ? AND revoked_at IS NULL)`, id, agentID,
+	).Scan(&isActiveTarget); err != nil {
+		return err
+	}
+	if !isActiveTarget {
 		return ErrNotFound
 	}
-	return nil
+	if active <= 1 {
+		return ErrLastCredential
+	}
+	if s.hasAgentKeyHashShadow {
+		var mirroredInShadow bool
+		if err := tx.QueryRow(`
+			SELECT EXISTS(SELECT 1 FROM agents a
+			 JOIN agent_credentials c ON c.agent_id = a.id
+			 WHERE a.id = ? AND c.id = ? AND a.api_key_hash = c.key_hash)`, agentID, id,
+		).Scan(&mirroredInShadow); err != nil {
+			return err
+		}
+		if mirroredInShadow {
+			tombstone := revokedShadowPrefix + agentID
+			if _, err := tx.Exec(
+				`UPDATE agents SET api_key_hash = ? WHERE id = ?`, tombstone, agentID); err != nil {
+				return err
+			}
+			// agent_id избыточен рядом с первичным ключом, но остальные запросы
+			// этой функции ограничены им явно. Единственная запись, чья
+			// безопасность держалась бы на проверке двадцатью строками выше,
+			// при перестановке кода стала бы разрушительной записью в чужую
+			// строку: ключ другого агента перестал бы работать без revoked_at
+			// и без строки лога.
+			if _, err := tx.Exec(
+				`UPDATE agent_credentials SET key_hash = ? WHERE id = ? AND agent_id = ?`,
+				tombstone, id, agentID); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(
+		`UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND agent_id = ? AND revoked_at IS NULL`,
+		at, id, agentID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // AgentByCredentialHash ищет агента по активному credential.

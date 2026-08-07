@@ -18,3 +18,9 @@
 ./internal/moderator TestFixedPromptBytesFitTheBudgetReserve
 ./internal/llm      TestAnthropicCallToolReportsUsage
 ./cmd/courtd        TestShippedModeratorBudgetIsEnforcedByTheProductionService
+./internal/core     TestRotationKeepsAgentIdentityStable
+./internal/core     TestRevokedCredentialStopsAuthenticating
+./internal/core     TestLastActiveCredentialCannotBeRevoked
+./internal/core     TestCredentialOperationsRejectAnotherAgentsCredential
+./internal/store    TestRevocationTombstonesTheRollbackShadow
+./internal/store    TestTombstonedShadowSurvivesThePreviousBinaryMigration

@@ -119,6 +119,9 @@ type replayErrorStorage struct {
 }
 
 func (replayErrorStorage) CreateAgent(core.Agent, core.Credential, string) error { return nil }
+func (replayErrorStorage) CreateCredential(core.Credential, string, int) error   { return nil }
+func (replayErrorStorage) Credentials(string) ([]core.Credential, error)         { return nil, nil }
+func (replayErrorStorage) RevokeCredential(string, string, time.Time) error      { return nil }
 func (replayErrorStorage) AgentByCredentialHash(string) (core.Agent, error) {
 	return core.Agent{}, errors.New("unused")
 }
