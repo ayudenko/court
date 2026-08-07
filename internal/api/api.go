@@ -45,6 +45,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("POST /api/agents", s.handleRegister)
 	mux.HandleFunc("GET /api/agents/me", s.auth(s.handleMe))
+	mux.HandleFunc("POST /api/agents/me/credentials", s.auth(s.handleIssueCredential))
+	mux.HandleFunc("GET /api/agents/me/credentials", s.auth(s.handleListCredentials))
+	mux.HandleFunc("DELETE /api/agents/me/credentials/{id}", s.auth(s.handleRevokeCredential))
 
 	mux.HandleFunc("POST /api/debates", s.auth(s.handleCreateDebate))
 	mux.HandleFunc("GET /api/debates", s.handleListDebates)
@@ -69,8 +72,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 // кривые аргументы, иначе запирает сам себя на час. Нераспознанное тело
 // (`decode`) остаётся оплаченным: иначе поток мусора на неаутентифицированную
 // регистрацию бесплатен, а лимит на ней — единственная защита.
+// Потолок действующих ключей возвращается тоже: строка не создана, работы не
+// сделано, а состояние потолка и так читается через список ключей — проверять
+// его вслепую незачем. Без возврата агент, упёршийся в потолок, обменивал бы
+// свой часовой бюджет на 429 и не мог выпустить замену сразу после того, как
+// освободил слот отзывом утёкшего ключа — то есть ровно в тот момент, ради
+// которого ротация и существует.
 func refundInvalid(grant *ratelimit.Grant, err error) {
-	if errors.Is(err, core.ErrValidation) {
+	if errors.Is(err, core.ErrValidation) || errors.Is(err, store.ErrTooManyCredentials) {
 		grant.Refund()
 	}
 }
@@ -160,6 +169,67 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, _ *http.Request, agent core.Agent) {
 	writeJSON(w, http.StatusOK, agent)
+}
+
+// --- Ключи агента ---
+//
+// Идентичность агента обязана переживать компрометацию секрета: протокол,
+// голоса и вердикт ссылаются на стабильный agent_id, а ключи сменяемы.
+// Порядок ротации — выпустить новый, затем отозвать старый.
+// См. docs/adr/0005-credential-rotation-and-revocation.md.
+
+// LogCredentialEvent записывает изменение набора секретов агента. Экспортирован
+// для MCP-обвязки: событие обязано выглядеть одинаково на обоих транспортах.
+//
+// Адрес клиента здесь обязателен, а не декоративен. Сами по себе «выпущен» и
+// «отозван» неотличимы для ротации владельцем и для угона украденным ключом —
+// это буквально одна и та же пара операций. Различает их адрес: отзыв с
+// адреса, с которого агент никогда не работал, — единственное механическое
+// правило, по которому критерий отката ADR 0005 вообще разрешим.
+//
+// Строка пишется только после успеха, поэтому credentialID к этому моменту
+// проверен хранилищем и не может быть произвольным текстом клиента.
+func LogCredentialEvent(log *slog.Logger, event string, agent core.Agent, credentialID, clientIP string) {
+	log.Info(event, "agent", agent.ID, "credential", credentialID, "ip", clientIP)
+}
+
+func (s *Server) handleIssueCredential(w http.ResponseWriter, r *http.Request, agent core.Agent) {
+	grant, err := s.limiter.AllowCredentialIssue(agent.ID, s.limiter.ClientIP(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	credential, key, err := s.svc.IssueCredential(agent)
+	if err != nil {
+		refundInvalid(&grant, err)
+		writeError(w, err)
+		return
+	}
+	LogCredentialEvent(s.log, "выпущен ключ агента", agent, credential.ID, s.limiter.ClientIP(r))
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"credential": credential,
+		"api_key":    key,
+		"note":       "Сохраните api_key: он показывается только один раз.",
+	})
+}
+
+func (s *Server) handleListCredentials(w http.ResponseWriter, _ *http.Request, agent core.Agent) {
+	list, err := s.svc.Credentials(agent)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"credentials": list})
+}
+
+func (s *Server) handleRevokeCredential(w http.ResponseWriter, r *http.Request, agent core.Agent) {
+	credentialID := r.PathValue("id")
+	if err := s.svc.RevokeCredential(agent, credentialID); err != nil {
+		writeError(w, err)
+		return
+	}
+	LogCredentialEvent(s.log, "отозван ключ агента", agent, credentialID, s.limiter.ClientIP(r))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agent core.Agent) {
@@ -425,7 +495,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusForbidden
 	case errors.Is(err, store.ErrNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, core.ErrNotYourTurn), errors.Is(err, core.ErrBadState):
+	case errors.Is(err, core.ErrNotYourTurn), errors.Is(err, core.ErrBadState),
+		errors.Is(err, store.ErrLastCredential), errors.Is(err, store.ErrTooManyCredentials):
 		status = http.StatusConflict
 	case errors.Is(err, ratelimit.ErrLimited):
 		status = http.StatusTooManyRequests

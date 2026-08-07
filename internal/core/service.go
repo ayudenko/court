@@ -83,6 +83,9 @@ var (
 // Storage — то, что ядру нужно от хранилища.
 type Storage interface {
 	CreateAgent(a Agent, credential Credential, keyHash string) error
+	CreateCredential(credential Credential, keyHash string, maxActive int) error
+	Credentials(agentID string) ([]Credential, error)
+	RevokeCredential(agentID, credentialID string, at time.Time) error
 	AgentByCredentialHash(hash string) (Agent, error)
 	AgentByID(id string) (Agent, error)
 	CreateDebate(d Debate) error
@@ -307,6 +310,42 @@ func (s *Service) Authenticate(apiKey string) (Agent, error) {
 		return Agent{}, ErrUnauthorized
 	}
 	return a, nil
+}
+
+// MaxActiveCredentials — потолок одновременно действующих ключей агента.
+// Лимит частоты ограничивает скорость появления секретов, но не их число;
+// набор действующих ключей должен быть конечным (ADR 0005).
+const MaxActiveCredentials = 10
+
+// IssueCredential выпускает агенту дополнительный ключ. Ключ возвращается
+// открытым один раз; дальше существует только его хэш.
+//
+// Выпуск и отзыв логируются на границе транспорта, а не здесь: единственный
+// признак, отличающий ротацию владельцем от угона украденным ключом, — адрес
+// клиента, а он ядру намеренно неизвестен (ADR 0003). См. LogCredentialEvent.
+func (s *Service) IssueCredential(agent Agent) (Credential, string, error) {
+	key := "ck_" + randHex(32)
+	credential := Credential{ID: s.newID("crd"), AgentID: agent.ID, CreatedAt: s.nowUTC()}
+	if err := s.store.CreateCredential(credential, hashKey(key), MaxActiveCredentials); err != nil {
+		return Credential{}, "", err
+	}
+	return credential, key, nil
+}
+
+// Credentials отдаёт ключи агента — метаданные без секретов.
+func (s *Service) Credentials(agent Agent) ([]Credential, error) {
+	return s.store.Credentials(agent.ID)
+}
+
+// RevokeCredential отзывает ключ агента. Владение, отсутствие и отзыв
+// последнего действующего ключа проверяет хранилище: только там проверка и
+// запись атомарны.
+func (s *Service) RevokeCredential(agent Agent, credentialID string) error {
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return fmt.Errorf("%w: нужен credential_id", ErrValidation)
+	}
+	return s.store.RevokeCredential(agent.ID, credentialID, s.nowUTC())
 }
 
 // --- Жизненный цикл дебатов ---

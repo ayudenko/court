@@ -25,7 +25,7 @@ func TestCredentialStoreKeepsStableAgentAcrossRotationAndRevocation(t *testing.T
 		t.Fatalf("CreateAgent: %v", err)
 	}
 	second := core.Credential{ID: "crd_second", AgentID: agent.ID, CreatedAt: now.Add(time.Minute)}
-	if err := st.CreateCredential(second, "hash-second"); err != nil {
+	if err := st.CreateCredential(second, "hash-second", core.MaxActiveCredentials); err != nil {
 		t.Fatalf("CreateCredential: %v", err)
 	}
 
@@ -39,7 +39,7 @@ func TestCredentialStoreKeepsStableAgentAcrossRotationAndRevocation(t *testing.T
 		}
 	}
 
-	if err := st.RevokeCredential(first.ID, now.Add(2*time.Minute)); err != nil {
+	if err := st.RevokeCredential(agent.ID, first.ID, now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("RevokeCredential: %v", err)
 	}
 	if _, err := st.AgentByCredentialHash("hash-first"); !errors.Is(err, ErrNotFound) {
@@ -48,7 +48,208 @@ func TestCredentialStoreKeepsStableAgentAcrossRotationAndRevocation(t *testing.T
 	if got, err := st.AgentByCredentialHash("hash-second"); err != nil || got.ID != agent.ID {
 		t.Fatalf("active credential resolved agent = %+v, err = %v", got, err)
 	}
+}
 
+// TestRevocationTombstonesTheRollbackShadow — ADR 0002 оставил
+// agents.api_key_hash как тень для отката на предыдущий бинарь и записал
+// условие: пока отзыв не опубликован, тень безопасна. Отзыв опубликован
+// (ADR 0005), поэтому тень обязана перестать быть вторым путём аутентификации:
+// иначе откат молча воскресил бы ключ, который владелец только что убил.
+func TestRevocationTombstonesTheRollbackShadow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tombstone.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	now := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
+	agent := core.Agent{ID: "agt_rotated", Name: "Rotated", CreatedAt: now}
+	first := core.Credential{ID: "crd_first", AgentID: agent.ID, CreatedAt: now}
+	if err := st.CreateAgent(agent, first, "hash-first"); err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+	second := core.Credential{ID: "crd_second", AgentID: agent.ID, CreatedAt: now.Add(time.Minute)}
+	if err := st.CreateCredential(second, "hash-second", core.MaxActiveCredentials); err != nil {
+		t.Fatalf("CreateCredential: %v", err)
+	}
+
+	// Выпуск дополнительного ключа тень не трогает: она хранит один хэш, и
+	// зеркалирование произвольного ключа сделало бы её несогласованной с
+	// таблицей credentials.
+	if shadow := shadowHash(t, st, agent.ID); shadow != "hash-first" {
+		t.Fatalf("issuing a credential changed the shadow to %q, want the registration hash", shadow)
+	}
+
+	if err := st.RevokeCredential(agent.ID, first.ID, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("RevokeCredential: %v", err)
+	}
+	shadow := shadowHash(t, st, agent.ID)
+	if shadow != revokedShadowPrefix+agent.ID {
+		t.Fatalf("shadow after revocation = %q, want %q", shadow, revokedShadowPrefix+agent.ID)
+	}
+
+	// Предыдущий бинарь аутентифицируется запросом по тени. После отзыва он не
+	// принимает ни отозванный ключ, ни выпущенный позже: fail-closed по
+	// доступности вместо воскрешённого секрета.
+	for _, hash := range []string{"hash-first", "hash-second"} {
+		var id string
+		err := st.db.QueryRow(`SELECT id FROM agents WHERE api_key_hash = ?`, hash).Scan(&id)
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("previous-binary shadow query for %q returned %q, err = %v; want no rows", hash, id, err)
+		}
+	}
+
+	// Новый бинарь по-прежнему принимает действующий ключ.
+	if got, err := st.AgentByCredentialHash("hash-second"); err != nil || got.ID != agent.ID {
+		t.Fatalf("active credential after revocation = %+v, err = %v", got, err)
+	}
+
+	// Рестарт не воскрешает надгробие как новый credential: догоняющая
+	// миграция копирует тень обратно, и без исключения каждый запуск создавал
+	// бы фантомный действующий ключ.
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	list, err := reopened.Credentials(agent.ID)
+	if err != nil {
+		t.Fatalf("Credentials: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("credentials after restart = %d (%+v), want the original two", len(list), list)
+	}
+	active := make([]string, 0, len(list))
+	for _, credential := range list {
+		if credential.RevokedAt == nil {
+			active = append(active, credential.ID)
+		}
+	}
+	if len(active) != 1 || active[0] != second.ID {
+		t.Fatalf("active credentials after restart = %v, want [%s]", active, second.ID)
+	}
+}
+
+// TestTombstonedShadowSurvivesThePreviousBinaryMigration — предыдущий бинарь не
+// только читает тень, он копирует её обратно в agent_credentials при каждом
+// старте. Надгробие обязано пережить этот запрос: на legacy-базе иначе
+// возникает конфликт первичного ключа (бинарь не стартует), а на свежей —
+// фантомный «действующий» ключ, который никто не выпускал и который обходит
+// правило последнего ключа. См. docs/adr/0005.
+func TestTombstonedShadowSurvivesThePreviousBinaryMigration(t *testing.T) {
+	// Обе формы идентификатора credential: legacy-строка, созданная миграцией
+	// ADR 0002 как 'crd_legacy_' || agent_id, и обычная случайная.
+	for _, testCase := range []struct {
+		name         string
+		agentID      string
+		credentialID string
+	}{
+		{"legacy migrated agent", "agt_legacy", "crd_legacy_agt_legacy"},
+		{"agent registered under v1", "agt_fresh", "crd_2f6c1d9ab3e4"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rollback.db")
+			st, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			now := time.Date(2026, 8, 7, 11, 0, 0, 0, time.UTC)
+			agent := core.Agent{ID: testCase.agentID, Name: "Rotated", CreatedAt: now}
+			first := core.Credential{ID: testCase.credentialID, AgentID: agent.ID, CreatedAt: now}
+			if err := st.CreateAgent(agent, first, "hash-first"); err != nil {
+				t.Fatalf("CreateAgent: %v", err)
+			}
+			second := core.Credential{ID: "crd_second", AgentID: agent.ID, CreatedAt: now.Add(time.Minute)}
+			if err := st.CreateCredential(second, "hash-second", core.MaxActiveCredentials); err != nil {
+				t.Fatalf("CreateCredential: %v", err)
+			}
+			if err := st.RevokeCredential(agent.ID, first.ID, now.Add(2*time.Minute)); err != nil {
+				t.Fatalf("RevokeCredential: %v", err)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatalf("Close before the rollback: %v", err)
+			}
+
+			// Дословно statements предыдущего бинаря: миграция без исключения
+			// надгробий и следующая за ней проверка целостности.
+			previous, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)")
+			if err != nil {
+				t.Fatalf("previous binary open: %v", err)
+			}
+			if _, err := previous.Exec(`
+				INSERT INTO agent_credentials (id, agent_id, key_hash, created_at)
+				SELECT 'crd_legacy_' || id, id, api_key_hash, created_at
+				FROM agents a
+				WHERE api_key_hash <> ''
+				  AND NOT EXISTS (
+					SELECT 1 FROM agent_credentials c WHERE c.key_hash = a.api_key_hash
+				  )
+			`); err != nil {
+				t.Fatalf("previous binary startup migration refused to run: %v", err)
+			}
+			var missing int
+			if err := previous.QueryRow(`
+				SELECT COUNT(*)
+				FROM agents a
+				LEFT JOIN agent_credentials c
+				  ON c.key_hash = a.api_key_hash AND c.agent_id = a.id
+				WHERE a.api_key_hash <> '' AND c.id IS NULL
+			`).Scan(&missing); err != nil {
+				t.Fatalf("previous binary consistency query: %v", err)
+			}
+			if missing != 0 {
+				t.Fatalf("previous binary reported %d unlinked keys, want 0", missing)
+			}
+			// Предыдущий бинарь аутентифицируется через agent_credentials, и
+			// отозванный ключ обязан остаться отозванным и для него.
+			var revived string
+			err = previous.QueryRow(
+				`SELECT id FROM agent_credentials WHERE key_hash = ? AND revoked_at IS NULL`, "hash-first",
+			).Scan(&revived)
+			if !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("previous binary revived credential %q, err = %v; want no rows", revived, err)
+			}
+			if err := previous.Close(); err != nil {
+				t.Fatalf("previous binary close: %v", err)
+			}
+
+			// Возврат вперёд: ни одного ключа, которого владелец не выпускал.
+			rolledForward, err := Open(path)
+			if err != nil {
+				t.Fatalf("roll forward: %v", err)
+			}
+			t.Cleanup(func() { _ = rolledForward.Close() })
+			list, err := rolledForward.Credentials(agent.ID)
+			if err != nil {
+				t.Fatalf("Credentials: %v", err)
+			}
+			active := make([]string, 0, len(list))
+			for _, credential := range list {
+				if credential.RevokedAt == nil {
+					active = append(active, credential.ID)
+				}
+			}
+			if len(active) != 1 || active[0] != second.ID {
+				t.Fatalf("active credentials after the rollback window = %v, want [%s]", active, second.ID)
+			}
+			// Фантомный ключ обошёл бы правило последнего: с ним отзыв
+			// единственного настоящего ключа прошёл бы успешно.
+			if err := rolledForward.RevokeCredential(agent.ID, second.ID, now.Add(time.Hour)); !errors.Is(err, ErrLastCredential) {
+				t.Fatalf("revoking the last real credential: err = %v, want ErrLastCredential", err)
+			}
+		})
+	}
+}
+
+func shadowHash(t *testing.T, st *Store, agentID string) string {
+	t.Helper()
+	var hash string
+	if err := st.db.QueryRow(`SELECT api_key_hash FROM agents WHERE id = ?`, agentID).Scan(&hash); err != nil {
+		t.Fatalf("read shadow hash: %v", err)
+	}
+	return hash
 }
 
 func TestFreshCredentialSchemaSupportsPreviousBinaryRollback(t *testing.T) {

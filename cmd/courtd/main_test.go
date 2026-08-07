@@ -39,10 +39,12 @@ func TestShippedDefaultsAreEnforcedByTheProductionHandler(t *testing.T) {
 	// Every shipped default is exercised: a limit that silently ships as 0 is
 	// disabled, and no other test would notice.
 	const (
-		defaultRegistrations  = 10
-		defaultDebatesByAgent = 10
-		defaultDebatesByIP    = 20
-		defaultStreams        = 20
+		defaultRegistrations    = 10
+		defaultDebatesByAgent   = 10
+		defaultDebatesByIP      = 20
+		defaultCredentialsAgent = 10
+		defaultCredentialsByIP  = 20
+		defaultStreams          = 20
 	)
 
 	// Registration, keyed by address.
@@ -84,6 +86,54 @@ func TestShippedDefaultsAreEnforcedByTheProductionHandler(t *testing.T) {
 	}
 	if status := postDebate(mux, keys[1], "203.0.113.9"); status != http.StatusTooManyRequests {
 		t.Fatalf("debate past the per-address default: status = %d, want 429", status)
+	}
+
+	// Credential issuance, keyed by agent. The active-credential cap and the
+	// hourly bucket are different limits — how many secrets work at once versus
+	// how fast rows accumulate — so a slot is freed by revoking before each
+	// probe and only the bucket can reject.
+	_, rotatorKey := postRegister(mux, "192.0.2.241")
+	issued := make([]string, 0, defaultCredentialsAgent)
+	for i := range core.MaxActiveCredentials - 1 {
+		status, id := postCredential(mux, rotatorKey, "192.0.2.241")
+		if status != http.StatusCreated {
+			t.Fatalf("credential %d for one agent: status = %d, want 201", i+1, status)
+		}
+		issued = append(issued, id)
+	}
+	for i := range defaultCredentialsAgent - (core.MaxActiveCredentials - 1) {
+		if status := deleteCredential(mux, rotatorKey, issued[i], "192.0.2.241"); status != http.StatusNoContent {
+			t.Fatalf("freeing a credential slot: status = %d, want 204", status)
+		}
+		status, id := postCredential(mux, rotatorKey, "192.0.2.241")
+		if status != http.StatusCreated {
+			t.Fatalf("credential %d for one agent: status = %d, want 201",
+				core.MaxActiveCredentials+i, status)
+		}
+		issued = append(issued, id)
+	}
+	if status := deleteCredential(mux, rotatorKey, issued[len(issued)-1], "192.0.2.241"); status != http.StatusNoContent {
+		t.Fatalf("freeing a credential slot before the final probe: status = %d, want 204", status)
+	}
+	if status, _ := postCredential(mux, rotatorKey, "192.0.2.241"); status != http.StatusTooManyRequests {
+		t.Fatalf("credential past the per-agent default: status = %d, want 429", status)
+	}
+
+	// Credential issuance, keyed by address: distinct agents, one address. Each
+	// agent issues once, so no agent bucket and no active-credential cap can be
+	// the cause of the rejection.
+	issuerKeys := make([]string, 0, defaultCredentialsByIP+1)
+	for i := range defaultCredentialsByIP + 1 {
+		_, key := postRegister(mux, fmt.Sprintf("192.0.2.1%02d", i/defaultRegistrations))
+		issuerKeys = append(issuerKeys, key)
+	}
+	for i, key := range issuerKeys[:defaultCredentialsByIP] {
+		if status, _ := postCredential(mux, key, "203.0.113.44"); status != http.StatusCreated {
+			t.Fatalf("credential %d from one address: status = %d, want 201", i+1, status)
+		}
+	}
+	if status, _ := postCredential(mux, issuerKeys[defaultCredentialsByIP], "203.0.113.44"); status != http.StatusTooManyRequests {
+		t.Fatalf("credential past the per-address default: status = %d, want 429", status)
 	}
 
 	// Concurrent streams, keyed by address. The debate is created by an agent
@@ -172,6 +222,8 @@ func TestEachLimitVariableReachesItsOwnField(t *testing.T) {
 	t.Setenv("COURT_RATE_DEBATES_PER_HOUR", "2")
 	t.Setenv("COURT_RATE_DEBATES_PER_HOUR_PER_IP", "3")
 	t.Setenv("COURT_MAX_STREAMS_PER_CLIENT", "4")
+	t.Setenv("COURT_RATE_CREDENTIALS_PER_HOUR", "5")
+	t.Setenv("COURT_RATE_CREDENTIALS_PER_HOUR_PER_IP", "6")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	limiter, err := buildRateLimiter(logger)
@@ -197,6 +249,14 @@ func TestEachLimitVariableReachesItsOwnField(t *testing.T) {
 		_, err := limiter.AcquireStream("", "203.0.113.7")
 		return err
 	})
+	assertAllowance(t, "credentials per agent", 5, func(attempt int) error {
+		_, err := limiter.AllowCredentialIssue("agt_fixed", fmt.Sprintf("192.0.2.%d", attempt))
+		return err
+	})
+	assertAllowance(t, "credentials per address", 6, func(attempt int) error {
+		_, err := limiter.AllowCredentialIssue(fmt.Sprintf("agt_%d", attempt), "198.51.100.4")
+		return err
+	})
 }
 
 // --- Хелперы ---
@@ -207,6 +267,8 @@ func rateLimitEnvVars() []string {
 		"COURT_RATE_REGISTRATIONS_PER_HOUR",
 		"COURT_RATE_DEBATES_PER_HOUR",
 		"COURT_RATE_DEBATES_PER_HOUR_PER_IP",
+		"COURT_RATE_CREDENTIALS_PER_HOUR",
+		"COURT_RATE_CREDENTIALS_PER_HOUR_PER_IP",
 		"COURT_MAX_STREAMS_PER_CLIENT",
 	}
 }
@@ -253,6 +315,30 @@ func postRegister(mux *http.ServeMux, clientIP string) (int, string) {
 func postDebate(mux *http.ServeMux, key, clientIP string) int {
 	request := httptest.NewRequest(http.MethodPost, "/api/debates",
 		strings.NewReader(`{"question":"Нужны ли лимиты?"}`))
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Fly-Client-IP", clientIP)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	return recorder.Code
+}
+
+func postCredential(mux *http.ServeMux, key, clientIP string) (int, string) {
+	request := httptest.NewRequest(http.MethodPost, "/api/agents/me/credentials", nil)
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Fly-Client-IP", clientIP)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	var body struct {
+		Credential struct {
+			ID string `json:"id"`
+		} `json:"credential"`
+	}
+	_ = json.Unmarshal(recorder.Body.Bytes(), &body)
+	return recorder.Code, body.Credential.ID
+}
+
+func deleteCredential(mux *http.ServeMux, key, credentialID, clientIP string) int {
+	request := httptest.NewRequest(http.MethodDelete, "/api/agents/me/credentials/"+credentialID, nil)
 	request.Header.Set("Authorization", "Bearer "+key)
 	request.Header.Set("Fly-Client-IP", clientIP)
 	recorder := httptest.NewRecorder()
