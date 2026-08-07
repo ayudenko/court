@@ -77,7 +77,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, system string, msgs [
 }
 
 // CallTool заставляет OpenAI-совместимую модель вернуть аргументы function tool.
-func (p *OpenAICompatProvider) CallTool(ctx context.Context, system string, msgs []Message, tool Tool) (json.RawMessage, error) {
+func (p *OpenAICompatProvider) CallTool(ctx context.Context, system string, msgs []Message, tool Tool) (json.RawMessage, Usage, error) {
 	var messages []openai.ChatCompletionMessageParamUnion
 	if system != "" {
 		messages = append(messages, openai.SystemMessage(system))
@@ -114,15 +114,23 @@ func (p *OpenAICompatProvider) CallTool(ctx context.Context, system string, msgs
 		),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("openai tool call: %w", err)
+		// ctx.Err() != nil означает, что ждать перестали мы: запрос принят и,
+		// вероятно, уже оплачен. Иначе запрос не дошёл и в счёт не вошёл.
+		return nil, Usage{Billed: ctx.Err() != nil}, fmt.Errorf("openai tool call: %w", err)
+	}
+	// Ответ получен и оплачен — usage возвращается и на путях с ошибкой.
+	usage := Usage{
+		Billed:       true,
+		InputTokens:  int(completion.Usage.PromptTokens),
+		OutputTokens: int(completion.Usage.CompletionTokens),
 	}
 	if len(completion.Choices) == 0 {
-		return nil, fmt.Errorf("openai tool call: пустой ответ")
+		return nil, usage, fmt.Errorf("openai tool call: пустой ответ")
 	}
 	for _, call := range completion.Choices[0].Message.ToolCalls {
 		if fn, ok := call.AsAny().(openai.ChatCompletionMessageFunctionToolCall); ok && fn.Function.Name == tool.Name {
-			return json.RawMessage(fn.Function.Arguments), nil
+			return json.RawMessage(fn.Function.Arguments), usage, nil
 		}
 	}
-	return nil, fmt.Errorf("openai tool call: модель не вызвала %q", tool.Name)
+	return nil, usage, fmt.Errorf("openai tool call: модель не вызвала %q", tool.Name)
 }

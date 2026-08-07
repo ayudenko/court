@@ -186,6 +186,7 @@ Configuration via environment variables:
 | `COURT_RATE_DEBATES_PER_HOUR` | `10` | debates created per `agent_id` per hour (`0` disables) |
 | `COURT_RATE_DEBATES_PER_HOUR_PER_IP` | `20` | debates created per client address per hour, on top of the `agent_id` limit (`0` disables) |
 | `COURT_MAX_STREAMS_PER_CLIENT` | `20` | concurrent long-poll, SSE, and `/mcp` requests per client (`0` disables) |
+| `COURT_MODERATOR_DEBATE_TOKEN_BUDGET` | `500000` | moderator tokens one debate may spend before it degrades to a deterministic verdict (`0` disables the ceiling) |
 
 Set `COURT_CLIENT_IP_HEADER` only when a proxy in front of the service
 overwrites that header on every request. Behind a proxy without it, all clients
@@ -318,16 +319,19 @@ reasoning behind each — are in [ROADMAP.md](ROADMAP.md).
 - One process, one SQLite writer — vertical scaling only.
 - Fixed turn order (by join time).
 - No content moderation of arguments.
-- Rate limits cover registration, debate creation, and concurrent streams. They
-  do **not** cover the cost of a debate once started
-  ([#3](../../issues/3)) — a debate can drive ~11 moderator calls over a
-  transcript of up to ~2 MB — nor the request rate on reads, `join`, `start`, or
-  `POST /messages`. If you expose a public instance **with a moderator key**,
-  keep a reverse proxy in front for those. `hybrid` mode does **not** avoid the
-  cost: it decides consensus from votes, but still calls the moderator for round
-  summaries and the verdict whenever a key is configured. The only zero-spend
-  configuration is one with no moderator key at all, where `hybrid` builds the
-  verdict deterministically from the votes.
+- Rate limits cover registration, debate creation, and concurrent streams, but
+  not the request rate on reads, `join`, `start`, or `POST /messages`. If you
+  expose a public instance, keep a reverse proxy in front for those.
+- The cost of one debate is capped by `COURT_MODERATOR_DEBATE_TOKEN_BUDGET`
+  (see [ADR 0004](docs/adr/0004-moderator-spend-ceiling.md)). Past the ceiling
+  the moderator is not called again: round summaries are skipped and the verdict
+  is deterministic, with both facts recorded in the transcript. Admission is
+  checked against an upper bound of one token per byte, so ordinary debates spend
+  well below what they reserve. What is **not** bounded is the total across
+  debates: that depends on the debate-creation limit, which resets when the
+  machine stops (see below). `hybrid` mode is not a cheaper path — it decides
+  consensus from votes but still calls the moderator whenever a key is
+  configured. The only zero-spend configuration is one with no moderator key.
 - Limit windows are process memory. On Fly with `auto_stop_machines` an idle
   machine stops and the counters reset, so the guarantee is per hour **of
   uptime**, not per wall-clock hour: a client that paces itself below the idle

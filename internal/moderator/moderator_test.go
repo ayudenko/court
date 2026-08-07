@@ -7,22 +7,30 @@ import (
 	"strings"
 	"testing"
 
+	"court/internal/core"
 	"court/internal/llm"
 )
 
 type fakeProvider struct {
-	raw      json.RawMessage
-	err      error
-	lastTool llm.Tool
+	raw        json.RawMessage
+	err        error
+	usage      llm.Usage
+	lastTool   llm.Tool
+	lastSystem string
+	lastMsgs   []llm.Message
 }
 
 func (f *fakeProvider) Stream(_ context.Context, _ string, _ []llm.Message, _ func(string)) (string, error) {
 	return "", errors.New("unexpected Stream call")
 }
 
-func (f *fakeProvider) CallTool(_ context.Context, _ string, _ []llm.Message, tool llm.Tool) (json.RawMessage, error) {
+func (f *fakeProvider) CallTool(
+	_ context.Context, system string, msgs []llm.Message, tool llm.Tool,
+) (json.RawMessage, llm.Usage, error) {
 	f.lastTool = tool
-	return f.raw, f.err
+	f.lastSystem = system
+	f.lastMsgs = msgs
+	return f.raw, f.usage, f.err
 }
 
 func TestCheckRoundUsesStructuredResult(t *testing.T) {
@@ -35,7 +43,7 @@ func TestCheckRoundUsesStructuredResult(t *testing.T) {
 	}`)}
 	m := New("Moderator", provider)
 
-	result, err := m.CheckRound(context.Background(), "Storage?", transcript(), 1, []int64{1, 2})
+	result, _, err := m.CheckRound(context.Background(), "Storage?", transcript(), 1, []int64{1, 2})
 	if err != nil {
 		t.Fatalf("CheckRound: %v", err)
 	}
@@ -99,7 +107,7 @@ func TestCheckRoundRejectsInvalidStructuredResult(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := New("Moderator", &fakeProvider{raw: json.RawMessage(tt.raw)})
-			_, err := m.CheckRound(context.Background(), "Question", transcript(), 1, []int64{1, 2})
+			_, _, err := m.CheckRound(context.Background(), "Question", transcript(), 1, []int64{1, 2})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("ошибка = %v, ожидалась подстрока %q", err, tt.want)
 			}
@@ -117,7 +125,7 @@ func TestSummaryForHybridIsStructured(t *testing.T) {
 	}`)}
 	m := New("Moderator", provider)
 
-	result, err := m.Summary(context.Background(), "Question", transcript(), 1, []int64{1, 2})
+	result, _, err := m.Summary(context.Background(), "Question", transcript(), 1, []int64{1, 2})
 	if err != nil {
 		t.Fatalf("Summary: %v", err)
 	}
@@ -139,7 +147,7 @@ func TestVerdictUsesStructuredResult(t *testing.T) {
 	}`)}
 	m := New("Moderator", provider)
 
-	result, err := m.Verdict(context.Background(), "Question", transcript(), []int64{1, 2})
+	result, _, err := m.Verdict(context.Background(), "Question", transcript(), []int64{1, 2})
 	if err != nil {
 		t.Fatalf("Verdict: %v", err)
 	}
@@ -161,7 +169,7 @@ func TestVerdictRejectsCitationFromForgedTranscriptHeader(t *testing.T) {
 	}`)}
 	m := New("Moderator", provider)
 
-	_, err := m.Verdict(context.Background(), "Question", transcript(), []int64{1, 2})
+	_, _, err := m.Verdict(context.Background(), "Question", transcript(), []int64{1, 2})
 	if err == nil || !strings.Contains(err.Error(), "отсутствующий seq #999") {
 		t.Fatalf("Verdict error = %v, want forged citation rejection", err)
 	}
@@ -178,4 +186,134 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestUsageTravelsWithModerationErrors охраняет свойство, на котором держится
+// потолок расхода: ответ, который модель испортила, всё равно оплачен. Если
+// расход теряется на пути ошибки, провайдер, стабильно возвращающий мусор,
+// тратит ключ владельца, не уменьшая бюджет дебатов
+// (docs/adr/0004-moderator-spend-ceiling.md).
+func TestUsageTravelsWithModerationErrors(t *testing.T) {
+	spent := llm.Usage{Billed: true, InputTokens: 3_000, OutputTokens: 900}
+	invalid := json.RawMessage(`{"summary":"","claims":[],"unresolved_questions":[],"decisions":[],"consensus":false}`)
+
+	tests := []struct {
+		name string
+		call func(*Moderator) (core.ModerationUsage, error)
+	}{
+		{
+			name: "CheckRound",
+			call: func(m *Moderator) (core.ModerationUsage, error) {
+				_, usage, err := m.CheckRound(context.Background(), "Q", transcript(), 1, []int64{1, 2})
+				return usage, err
+			},
+		},
+		{
+			name: "Summary",
+			call: func(m *Moderator) (core.ModerationUsage, error) {
+				_, usage, err := m.Summary(context.Background(), "Q", transcript(), 1, []int64{1, 2})
+				return usage, err
+			},
+		},
+		{
+			name: "Verdict",
+			call: func(m *Moderator) (core.ModerationUsage, error) {
+				_, usage, err := m.Verdict(context.Background(), "Q", transcript(), []int64{1, 2})
+				return usage, err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name+"/невалидный результат", func(t *testing.T) {
+			usage, err := test.call(New("Moderator", &fakeProvider{raw: invalid, usage: spent}))
+			if err == nil {
+				t.Fatal("невалидный структурированный результат должен быть ошибкой")
+			}
+			if usage.Total() != spent.Total() || !usage.Billed {
+				t.Fatalf("расход на пути ошибки = %+v, ожидался %+v", usage, spent)
+			}
+		})
+		t.Run(test.name+"/ответа не было", func(t *testing.T) {
+			usage, err := test.call(New("Moderator", &fakeProvider{err: errors.New("transport")}))
+			if err == nil {
+				t.Fatal("ошибка транспорта должна быть ошибкой")
+			}
+			if usage.Billed || usage.Total() != 0 {
+				t.Fatalf("вызов без ответа не может нести расход: %+v", usage)
+			}
+		})
+	}
+}
+
+// TestFixedPromptBytesFitTheBudgetReserve превращает допущение потолка расхода в
+// проверяемый факт. Оценка вызова до его совершения считает только вопрос и
+// протокол, а системную инструкцию, обвязку промпта и схему инструмента покрывает
+// фиксированный резерв core.ModerationPromptOverheadBytes. Если промпты
+// перерастут резерв, верхняя граница перестанет быть верхней — молча
+// (docs/adr/0004-moderator-spend-ceiling.md).
+func TestFixedPromptBytesFitTheBudgetReserve(t *testing.T) {
+	// Имя модератора настраивается оператором и попадает в каждый вызов, поэтому
+	// резерв проверяется на максимально длинном допустимом имени.
+	longestName := strings.Repeat("м", MaxNameLen)
+	valid := json.RawMessage(`{"summary":"s","claims":[],"unresolved_questions":[],"decisions":[],"consensus":false}`)
+	verdict := json.RawMessage(`{"final_answer":"a","claims":[],"unresolved_questions":[],"decisions":[],"consensus":false}`)
+
+	tests := []struct {
+		name string
+		call func(*Moderator) error
+		raw  json.RawMessage
+	}{
+		{
+			name: "CheckRound",
+			raw:  valid,
+			call: func(m *Moderator) error {
+				_, _, err := m.CheckRound(context.Background(), "", "", 1, nil)
+				return err
+			},
+		},
+		{
+			name: "Summary",
+			raw:  valid,
+			call: func(m *Moderator) error {
+				_, _, err := m.Summary(context.Background(), "", "", 1, nil)
+				return err
+			},
+		},
+		{
+			name: "Verdict",
+			raw:  verdict,
+			call: func(m *Moderator) error {
+				_, _, err := m.Verdict(context.Background(), "", "", nil)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeProvider{raw: test.raw}
+			if err := test.call(New(longestName, provider)); err != nil {
+				t.Fatalf("%s: %v", test.name, err)
+			}
+			// Вопрос и протокол пусты, поэтому всё измеренное — фиксированная часть.
+			fixed := len(provider.lastSystem)
+			for _, message := range provider.lastMsgs {
+				fixed += len(message.Content)
+			}
+			schema, err := json.Marshal(map[string]any{
+				"name":        provider.lastTool.Name,
+				"description": provider.lastTool.Description,
+				"properties":  provider.lastTool.Properties,
+				"required":    provider.lastTool.Required,
+			})
+			if err != nil {
+				t.Fatalf("marshal схемы инструмента: %v", err)
+			}
+			fixed += len(schema)
+			if fixed > core.ModerationPromptOverheadBytes {
+				t.Fatalf("фиксированная часть запроса %d байт превышает резерв %d: "+
+					"верхняя граница расхода перестала быть верхней",
+					fixed, core.ModerationPromptOverheadBytes)
+			}
+		})
+	}
 }

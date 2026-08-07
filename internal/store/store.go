@@ -57,7 +57,11 @@ CREATE TABLE IF NOT EXISTS debates (
 	turn_agent_id TEXT NOT NULL DEFAULT '',
 	turn_deadline TIMESTAMP,
 	consensus     INTEGER NOT NULL DEFAULT 0,
-	created_at    TIMESTAMP NOT NULL
+	created_at    TIMESTAMP NOT NULL,
+	-- moderator_tokens: накопленный расход LLM-модератора на эти дебаты.
+	-- Хранится, а не считается на лету, потому что потолок расхода обязан
+	-- переживать рестарт (docs/adr/0004-moderator-spend-ceiling.md).
+	moderator_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS participants (
 	debate_id TEXT NOT NULL REFERENCES debates(id),
@@ -103,6 +107,7 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE messages ADD COLUMN support_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN support_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN moderation_json TEXT`,
+		`ALTER TABLE debates ADD COLUMN moderator_tokens INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return nil, fmt.Errorf("миграция схемы: %w", err)
@@ -255,6 +260,24 @@ func (s *Store) UpdateDebate(d core.Debate) error {
 	return err
 }
 
+// AddModeratorTokens увеличивает накопленный расход LLM-модератора на дебаты.
+// Инкремент выполняет SQLite, а не Go: UpdateDebate пишет состояние из копии
+// Debate, которая могла быть прочитана до предыдущего списания, и запись
+// значения потеряла бы часть расхода.
+func (s *Store) AddModeratorTokens(debateID string, tokens int) error {
+	res, err := s.db.Exec(
+		`UPDATE debates SET moderator_tokens = moderator_tokens + ? WHERE id = ?`,
+		tokens, debateID,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // DeleteDebate удаляет дискуссию вместе с участниками и протоколом.
 func (s *Store) DeleteDebate(id string) error {
 	tx, err := s.db.Begin()
@@ -311,7 +334,8 @@ func (s *Store) ActiveDebates() ([]core.Debate, error) {
 func (s *Store) queryDebates(tail string, args ...any) (_ []core.Debate, err error) {
 	rows, err := s.db.Query(
 		`SELECT id, question, description, mode, status, rounds, current_round, turn_timeout,
-		        prep_time, creator_id, turn_agent_id, turn_deadline, consensus, created_at
+		        prep_time, creator_id, turn_agent_id, turn_deadline, consensus, created_at,
+		        moderator_tokens
 		 FROM debates `+tail, args...)
 	if err != nil {
 		return nil, err
@@ -325,7 +349,8 @@ func (s *Store) queryDebates(tail string, args ...any) (_ []core.Debate, err err
 		var deadline sql.NullTime
 		var consensus int
 		if err := rows.Scan(&d.ID, &d.Question, &d.Description, &d.Mode, &d.Status, &d.Rounds, &d.CurrentRound,
-			&d.TurnTimeout, &d.PrepTime, &d.CreatorID, &d.TurnAgentID, &deadline, &consensus, &d.CreatedAt); err != nil {
+			&d.TurnTimeout, &d.PrepTime, &d.CreatorID, &d.TurnAgentID, &deadline, &consensus, &d.CreatedAt,
+			&d.ModeratorTokens); err != nil {
 			return nil, err
 		}
 		d.TurnDeadline = deadline.Time

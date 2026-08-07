@@ -71,7 +71,7 @@ func (p *AnthropicProvider) Stream(ctx context.Context, system string, msgs []Me
 }
 
 // CallTool заставляет Claude вернуть типизированный результат через tool use.
-func (p *AnthropicProvider) CallTool(ctx context.Context, system string, msgs []Message, tool Tool) (json.RawMessage, error) {
+func (p *AnthropicProvider) CallTool(ctx context.Context, system string, msgs []Message, tool Tool) (json.RawMessage, Usage, error) {
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(p.model),
 		MaxTokens: p.maxTokens,
@@ -104,12 +104,22 @@ func (p *AnthropicProvider) CallTool(ctx context.Context, system string, msgs []
 
 	message, err := p.client.Messages.New(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic tool call: %w", err)
+		// ctx.Err() != nil означает, что ждать перестали мы: запрос принят и,
+		// вероятно, уже оплачен. Иначе запрос не дошёл и в счёт не вошёл.
+		return nil, Usage{Billed: ctx.Err() != nil}, fmt.Errorf("anthropic tool call: %w", err)
+	}
+	// Ответ получен — он оплачен независимо от того, вызвала модель инструмент
+	// или нет, поэтому usage возвращается на всех дальнейших путях.
+	usage := Usage{
+		Billed: true,
+		InputTokens: int(message.Usage.InputTokens +
+			message.Usage.CacheCreationInputTokens + message.Usage.CacheReadInputTokens),
+		OutputTokens: int(message.Usage.OutputTokens),
 	}
 	for _, block := range message.Content {
 		if call, ok := block.AsAny().(anthropic.ToolUseBlock); ok && call.Name == tool.Name {
-			return call.Input, nil
+			return call.Input, usage, nil
 		}
 	}
-	return nil, fmt.Errorf("anthropic tool call: модель не вызвала %q", tool.Name)
+	return nil, usage, fmt.Errorf("anthropic tool call: модель не вызвала %q", tool.Name)
 }
