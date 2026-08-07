@@ -32,8 +32,12 @@
 //	                                   (по умолчанию 10)
 //	COURT_RATE_DEBATES_PER_HOUR_PER_IP создание дебатов с одного адреса в час,
 //	                                   поверх лимита на agent_id (по умолчанию 20)
-//	COURT_MAX_STREAMS_PER_CLIENT       одновременных long-poll, SSE и запросов
-//	                                   к /mcp на клиента (по умолчанию 20)
+//	COURT_MAX_STREAMS_PER_CLIENT       одновременных long-poll, SSE, запросов
+//	                                   к /mcp и экспортов на клиента
+//	                                   (по умолчанию 20). Потолок одновременных
+//	                                   сборок экспорта на процесс задан в коде:
+//	                                   это ограничение памяти, а не политика
+//	                                   клиента (см. api.MaxConcurrentExports).
 package main
 
 import (

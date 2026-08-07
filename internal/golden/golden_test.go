@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"court/internal/protocol"
 )
 
 func TestGenerateMatchesCheckedInGoldenTraces(t *testing.T) {
@@ -44,7 +46,7 @@ func TestGenerateMatchesCheckedInGoldenTraces(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReplayJSONL: %v", err)
 			}
-			roundTrip, err := MarshalJSONL(replayed)
+			roundTrip, err := protocol.MarshalJSONL(replayed)
 			if err != nil {
 				t.Fatalf("MarshalJSONL: %v", err)
 			}
@@ -92,7 +94,7 @@ func TestReplayCanonicalizesRecordOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReplayJSONL: %v", err)
 	}
-	canonical, err := MarshalJSONL(replayed)
+	canonical, err := protocol.MarshalJSONL(replayed)
 	if err != nil {
 		t.Fatalf("MarshalJSONL: %v", err)
 	}
