@@ -365,3 +365,229 @@ func openSubscription(t *testing.T, baseURL string) func() {
 	}
 	return func() { _ = response.Body.Close() }
 }
+
+// TestShippedModeratorBudgetIsEnforcedByTheProductionService — та же защита от
+// fail-open, что и для лимитера, но для потолка расхода модератора. Потолок,
+// потерянный при сборке сервиса, не ломает ни один функциональный путь: дебаты
+// продолжают работать, просто их стоимость снова ничем не ограничена, и ни один
+// пакетный тест этого не заметит.
+func TestShippedModeratorBudgetIsEnforcedByTheProductionService(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Потолок из окружения обязан доехать до ядра и отсечь вызов модератора.
+	// 8193 — минимально допустимое значение, которого всё ещё не хватает на
+	// реальный вызов: так проверяется и плумбинг, и то, что отсекает именно
+	// бюджет.
+	t.Setenv("COURT_MODERATOR_DEBATE_TOKEN_BUDGET", "8193")
+	moderator := &refusingModerator{t: t}
+	service, err := buildService(newTestStore(t), moderator, logger)
+	if err != nil {
+		t.Fatalf("buildService: %v", err)
+	}
+	if concluded := runDebate(t, service, 1, 2, 64); concluded.Consensus {
+		t.Fatal("детерминированный итог не может дать консенсус без итога раунда")
+	}
+	if moderator.called() {
+		t.Fatal("модератор вызван при исчерпанном бюджете — бюджет не доехал до сервиса")
+	}
+
+	// Бюджет, которого не хватает даже на пустые дебаты, обязан валить запуск:
+	// иначе это отключение модерации под видом ограничения расхода.
+	t.Setenv("COURT_MODERATOR_DEBATE_TOKEN_BUDGET", "5000")
+	if _, err := buildService(newTestStore(t), moderator, logger); err == nil {
+		t.Fatal("бюджет ниже минимально осмысленного принят молча")
+	}
+
+	// Умолчание, с которым сервис уезжает в продакшн, обязано без деградации
+	// проводить дебаты той формы, которую ADR 0004 называет обычной: 10 раундов,
+	// 5 участников, реплики по 2000 символов кириллицы (4000 байт). Проверка
+	// именно этой формы делает критерий откату ADR наблюдаемым в CI — короткие
+	// дебаты прошли бы и под потолком в 50 раз меньше.
+	t.Setenv("COURT_MODERATOR_DEBATE_TOKEN_BUDGET", "")
+	defaultService, err := buildService(newTestStore(t), &countingVerdictModerator{}, logger)
+	if err != nil {
+		t.Fatalf("buildService с умолчанием: %v", err)
+	}
+	concluded := runDebate(t, defaultService, 10, 5, 4000)
+	if !concluded.Consensus {
+		t.Fatalf("дебаты обычной формы под умолчанием %d токенов деградировали вместо вердикта модели",
+			defaultDebateTokenBudget)
+	}
+}
+
+func newTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	database, err := store.Open(filepath.Join(t.TempDir(), "court.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("store.Close: %v", err)
+		}
+	})
+	return database
+}
+
+// runDebate проводит дебаты заданной формы до статуса concluded: rounds
+// раундов, participants участников, реплики размером argumentBytes байт.
+func runDebate(t *testing.T, service *core.Service, rounds, participants, argumentBytes int) core.DebateView {
+	t.Helper()
+	agents := make([]core.Agent, 0, participants)
+	for i := range participants {
+		agent, _, err := service.RegisterAgent(fmt.Sprintf("участник-%d", i), "")
+		if err != nil {
+			t.Fatalf("RegisterAgent(%d): %v", i, err)
+		}
+		agents = append(agents, agent)
+	}
+	created, err := service.CreateDebate(agents[0], core.CreateDebateParams{
+		Question:       "Нужен ли потолок расхода?",
+		Mode:           core.ModeModerator,
+		Rounds:         rounds,
+		TurnTimeoutSec: core.MinTurnTimeout,
+	})
+	if err != nil {
+		t.Fatalf("CreateDebate: %v", err)
+	}
+	for _, agent := range agents[1:] {
+		if _, err := service.JoinDebate(agent, created.ID, "возражаю"); err != nil {
+			t.Fatalf("JoinDebate(%s): %v", agent.Name, err)
+		}
+	}
+	if _, err := service.StartDebate(agents[0], created.ID); err != nil {
+		t.Fatalf("StartDebate: %v", err)
+	}
+
+	// Кириллица: два байта на символ, как в реальном протоколе.
+	argument := strings.Repeat("я", argumentBytes/2)
+	for range rounds {
+		for _, agent := range agents {
+			waitForTurnOf(t, service, created.ID, agent.ID)
+			if _, err := service.PostArgument(context.Background(), agent, created.ID, argument, ""); err != nil {
+				t.Fatalf("PostArgument(%s): %v", agent.Name, err)
+			}
+		}
+	}
+	return waitForConclusion(t, service, created.ID)
+}
+
+func waitForTurnOf(t *testing.T, service *core.Service, debateID, agentID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		debate, err := service.GetDebate(debateID)
+		if err != nil {
+			t.Fatalf("GetDebate: %v", err)
+		}
+		if debate.Status == core.StatusRunning && debate.TurnAgentID == agentID {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("ход не перешёл к %s", agentID)
+}
+
+func waitForConclusion(t *testing.T, service *core.Service, debateID string) core.DebateView {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		debate, err := service.GetDebate(debateID)
+		if err != nil {
+			t.Fatalf("GetDebate: %v", err)
+		}
+		if debate.Status == core.StatusConcluded {
+			return debate
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("дебаты не завершились")
+	return core.DebateView{}
+}
+
+// refusingModerator валит тест при любом обращении: под исчерпанным бюджетом
+// сервис не имеет права тратить ключ владельца.
+type refusingModerator struct {
+	t     *testing.T
+	mu    sync.Mutex
+	calls int
+}
+
+func (m *refusingModerator) Name() string { return "не должен вызываться" }
+
+func (m *refusingModerator) record() {
+	m.mu.Lock()
+	m.calls++
+	m.mu.Unlock()
+}
+
+func (m *refusingModerator) called() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls > 0
+}
+
+func (m *refusingModerator) CheckRound(
+	context.Context, string, string, int, []int64,
+) (core.RoundSummary, core.ModerationUsage, error) {
+	m.record()
+	return core.RoundSummary{}, core.ModerationUsage{}, nil
+}
+
+func (m *refusingModerator) Summary(
+	context.Context, string, string, int, []int64,
+) (core.RoundSummary, core.ModerationUsage, error) {
+	m.record()
+	return core.RoundSummary{}, core.ModerationUsage{}, nil
+}
+
+func (m *refusingModerator) Verdict(
+	context.Context, string, string, []int64,
+) (core.ModerationVerdict, core.ModerationUsage, error) {
+	m.record()
+	return core.ModerationVerdict{}, core.ModerationUsage{}, nil
+}
+
+// countingVerdictModerator ведёт себя как рабочий модератор на кириллическом
+// протоколе: консенсус объявляет только вердикт (иначе дебаты завершились бы
+// после первого же раунда), а расход сообщает пропорционально размеру
+// протокола — около пяти байт на токен, как реальная токенизация. Без этого
+// пропорционального расхода тест проверял бы допуск при заниженном списании.
+type countingVerdictModerator struct{}
+
+func (*countingVerdictModerator) Name() string { return "модератор" }
+
+// cyrillicBytesPerToken — наблюдаемое отношение байт к токенам для русского
+// текста в UTF-8. Оценка допуска считает по одному токену на байт, поэтому
+// разница между этими числами и есть запас, ради которого выбрано умолчание.
+const cyrillicBytesPerToken = 5
+
+func realisticUsage(question, transcript string) core.ModerationUsage {
+	return core.ModerationUsage{
+		Billed:       true,
+		InputTokens:  (len(question) + len(transcript)) / cyrillicBytesPerToken,
+		OutputTokens: 600,
+	}
+}
+
+func (*countingVerdictModerator) CheckRound(
+	_ context.Context, question, transcript string, _ int, _ []int64,
+) (core.RoundSummary, core.ModerationUsage, error) {
+	return core.RoundSummary{
+		Summary:             "Итог раунда.",
+		UnresolvedQuestions: []string{"Вопрос остаётся открытым."},
+	}, realisticUsage(question, transcript), nil
+}
+
+func (*countingVerdictModerator) Summary(
+	_ context.Context, question, transcript string, _ int, _ []int64,
+) (core.RoundSummary, core.ModerationUsage, error) {
+	return core.RoundSummary{Summary: "Резюме."}, realisticUsage(question, transcript), nil
+}
+
+func (*countingVerdictModerator) Verdict(
+	_ context.Context, question, transcript string, _ []int64,
+) (core.ModerationVerdict, core.ModerationUsage, error) {
+	return core.ModerationVerdict{FinalAnswer: "Итог модели.", Consensus: true},
+		realisticUsage(question, transcript), nil
+}

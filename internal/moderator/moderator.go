@@ -18,16 +18,26 @@ const (
 	verdictTool      = "submit_verdict"
 )
 
+// MaxNameLen ограничивает отображаемое имя модератора. Имя попадает в системную
+// инструкцию каждого вызова, а её размер входит в фиксированный резерв, из
+// которого считается верхняя граница расхода: имя без предела делало бы этот
+// резерв необязательным (docs/adr/0004-moderator-spend-ceiling.md).
+const MaxNameLen = 100
+
 // Moderator подводит итоги раундов и выносит вердикт через LLM.
 type Moderator struct {
 	name     string
 	provider llm.Provider
 }
 
-// New создаёт модератора поверх любого llm.Provider.
+// New создаёт модератора поверх любого llm.Provider. Слишком длинное имя
+// обрезается: см. MaxNameLen.
 func New(name string, provider llm.Provider) *Moderator {
 	if name == "" {
 		name = "Модератор"
+	}
+	if runes := []rune(name); len(runes) > MaxNameLen {
+		name = string(runes[:MaxNameLen])
 	}
 	return &Moderator{name: name, provider: provider}
 }
@@ -42,8 +52,17 @@ func (m *Moderator) system(task string) string {
 разногласия от споров о формулировках. %s`, m.name, task)
 }
 
+// usage переводит расход провайдера в доменную единицу учёта.
+func usage(u llm.Usage) core.ModerationUsage {
+	return core.ModerationUsage{
+		Billed:       u.Billed,
+		InputTokens:  u.InputTokens,
+		OutputTokens: u.OutputTokens,
+	}
+}
+
 // CheckRound подводит итог раунда и определяет, достигнут ли консенсус.
-func (m *Moderator) CheckRound(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (core.RoundSummary, error) {
+func (m *Moderator) CheckRound(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (core.RoundSummary, core.ModerationUsage, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -67,7 +86,7 @@ func (m *Moderator) CheckRound(ctx context.Context, question, transcript string,
 
 // Summary подводит итог раунда без решения о консенсусе (режим hybrid,
 // где консенсус определяют голоса участников).
-func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (core.RoundSummary, error) {
+func (m *Moderator) Summary(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (core.RoundSummary, core.ModerationUsage, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -90,7 +109,7 @@ consensus=false. Для каждого тезиса укажи seq исходн�
 }
 
 // Verdict выносит итоговое решение по завершённой дискуссии.
-func (m *Moderator) Verdict(ctx context.Context, question, transcript string, allowedSeqs []int64) (core.ModerationVerdict, error) {
+func (m *Moderator) Verdict(ctx context.Context, question, transcript string, allowedSeqs []int64) (core.ModerationVerdict, core.ModerationUsage, error) {
 	prompt := fmt.Sprintf(
 		`Вопрос на обсуждение:
 %s
@@ -108,36 +127,36 @@ func (m *Moderator) Verdict(ctx context.Context, question, transcript string, al
 		question, transcript,
 	)
 	tool := verdictSchema()
-	raw, err := m.provider.CallTool(ctx,
+	raw, spent, err := m.provider.CallTool(ctx,
 		m.system("Дискуссия завершена — твоя задача вынести итоговое решение."),
 		[]llm.Message{{Role: llm.RoleUser, Content: prompt}}, tool)
 	if err != nil {
-		return core.ModerationVerdict{}, err
+		return core.ModerationVerdict{}, usage(spent), err
 	}
 	result, err := decodeStructured[core.ModerationVerdict](raw, tool.Required)
 	if err != nil {
-		return core.ModerationVerdict{}, fmt.Errorf("структурированный вердикт: %w", err)
+		return core.ModerationVerdict{}, usage(spent), fmt.Errorf("структурированный вердикт: %w", err)
 	}
 	if err := validateVerdict(result, allowedSeqs); err != nil {
-		return core.ModerationVerdict{}, fmt.Errorf("структурированный вердикт: %w", err)
+		return core.ModerationVerdict{}, usage(spent), fmt.Errorf("структурированный вердикт: %w", err)
 	}
-	return result, nil
+	return result, usage(spent), nil
 }
 
-func (m *Moderator) roundSummary(ctx context.Context, allowedSeqs []int64, system string, msgs []llm.Message) (core.RoundSummary, error) {
+func (m *Moderator) roundSummary(ctx context.Context, allowedSeqs []int64, system string, msgs []llm.Message) (core.RoundSummary, core.ModerationUsage, error) {
 	tool := roundSummarySchema()
-	raw, err := m.provider.CallTool(ctx, system, msgs, tool)
+	raw, spent, err := m.provider.CallTool(ctx, system, msgs, tool)
 	if err != nil {
-		return core.RoundSummary{}, err
+		return core.RoundSummary{}, usage(spent), err
 	}
 	result, err := decodeStructured[core.RoundSummary](raw, tool.Required)
 	if err != nil {
-		return core.RoundSummary{}, fmt.Errorf("структурированное резюме: %w", err)
+		return core.RoundSummary{}, usage(spent), fmt.Errorf("структурированное резюме: %w", err)
 	}
 	if err := validateRoundSummary(result, allowedSeqs); err != nil {
-		return core.RoundSummary{}, fmt.Errorf("структурированное резюме: %w", err)
+		return core.RoundSummary{}, usage(spent), fmt.Errorf("структурированное резюме: %w", err)
 	}
-	return result, nil
+	return result, usage(spent), nil
 }
 
 func roundSummarySchema() llm.Tool {

@@ -7,3 +7,14 @@
 ./internal/api      TestCreateDebateRateLimitIsPerAgentKey
 ./internal/api      TestStreamLimitReleasesSlotOnDisconnect
 ./cmd/courtd        TestShippedDefaultsAreEnforcedByTheProductionHandler
+./internal/core     TestModeratorSpendCeilingDegradesToDeterministicVerdict
+./internal/core     TestModeratorSpendCeilingKeepsConsensusFoundBeforeExhaustion
+./internal/core     TestModeratorSpendCeilingSurvivesRestart
+./internal/core     TestModeratorSpendCeilingChargesUnreportedUsageAsEstimate
+./internal/core     TestModeratorSpendCeilingChargesFailedCalls
+./internal/core     TestModeratorSpendCeilingDoesNotChargeUnbilledCalls
+./internal/core     TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries
+./internal/moderator TestUsageTravelsWithModerationErrors
+./internal/moderator TestFixedPromptBytesFitTheBudgetReserve
+./internal/llm      TestAnthropicCallToolReportsUsage
+./cmd/courtd        TestShippedModeratorBudgetIsEnforcedByTheProductionService

@@ -33,12 +33,17 @@ Do not document raw Go command sequences elsewhere; link to these make targets.
 | Structured moderation | `TestCheckRoundUsesStructuredResult`, `TestCheckRoundRejectsInvalidStructuredResult` | enforced by `make check` |
 | Store concurrency/restart | issues #18 and #6 | tracked; named tests required when implemented |
 | REST/MCP core-state parity | issue #8 | tracked; named conformance test required |
-| Credential rotation and spend boundary | issues #3, #5, #20 | tracked; security review and named tests required |
+| Moderator spend boundary and credentials | `TestModeratorSpendCeilingDegradesToDeterministicVerdict`, `TestModeratorSpendCeilingKeepsConsensusFoundBeforeExhaustion`, `TestModeratorSpendCeilingSurvivesRestart`, `TestModeratorSpendCeilingChargesUnreportedUsageAsEstimate`, `TestModeratorSpendCeilingChargesFailedCalls`, `TestModeratorSpendCeilingDoesNotChargeUnbilledCalls`, `TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries`, `TestUsageTravelsWithModerationErrors`, `TestFixedPromptBytesFitTheBudgetReserve`, `TestAnthropicCallToolReportsUsage`, `TestShippedModeratorBudgetIsEnforcedByTheProductionService` | spend enforced by `make check`; credentials (#5) and web key storage (#20) remain tracked debt |
 
 A row without a named test must point to an issue and is debt, not an enforced
 guarantee. `quality/enforced-tests.txt` maps every enforced name above to its Go
 package; `make matrix-check` verifies the two sources match and that Go discovers
 each test. Keep this table at six rows or fewer.
+
+The six-row cap forces some rows to carry both an enforced guarantee and residual
+debt. Such a row is classified per part, not as a whole: the named tests are
+**automated**, and each linked issue stays **tracked debt** until it has its own
+named test. A row loses its debt half only when no issue remains on it.
 
 ## Agent collaboration
 

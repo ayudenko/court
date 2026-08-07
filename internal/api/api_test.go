@@ -141,16 +141,23 @@ func (replayErrorStorage) AddMessage(core.Message) (int64, error)          { ret
 func (replayErrorStorage) Messages(string, int64) ([]core.Message, error) {
 	return nil, errors.New("replay failed")
 }
+func (replayErrorStorage) AddModeratorTokens(string, int) error { return nil }
 
 type unusedModerator struct{}
 
 func (unusedModerator) Name() string { return "unused" }
-func (unusedModerator) CheckRound(context.Context, string, string, int, []int64) (core.RoundSummary, error) {
-	return core.RoundSummary{}, errors.New("unused")
+func (unusedModerator) CheckRound(
+	context.Context, string, string, int, []int64,
+) (core.RoundSummary, core.ModerationUsage, error) {
+	return core.RoundSummary{}, core.ModerationUsage{}, errors.New("unused")
 }
-func (unusedModerator) Summary(context.Context, string, string, int, []int64) (core.RoundSummary, error) {
-	return core.RoundSummary{}, errors.New("unused")
+func (unusedModerator) Summary(
+	context.Context, string, string, int, []int64,
+) (core.RoundSummary, core.ModerationUsage, error) {
+	return core.RoundSummary{}, core.ModerationUsage{}, errors.New("unused")
 }
-func (unusedModerator) Verdict(context.Context, string, string, []int64) (core.ModerationVerdict, error) {
-	return core.ModerationVerdict{}, errors.New("unused")
+func (unusedModerator) Verdict(
+	context.Context, string, string, []int64,
+) (core.ModerationVerdict, core.ModerationUsage, error) {
+	return core.ModerationVerdict{}, core.ModerationUsage{}, errors.New("unused")
 }

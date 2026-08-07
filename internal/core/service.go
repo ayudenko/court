@@ -23,10 +23,53 @@ const (
 	MaxRounds         = 10
 	MaxPrepTime       = 3600
 
-	// moderationTimeout ограничивает итог раунда и вердикт (до двух LLM-вызовов),
-	// чтобы зависший провайдер не держал дебаты в статусе moderating вечно.
+	// moderationTimeout ограничивает один вызов модератора, чтобы зависший
+	// провайдер не держал дебаты в статусе moderating вечно. Именно на вызов, а не
+	// на весь проход: общий дедлайн на два вызова означал, что медленный итог
+	// раунда оставлял вердикту мёртвый контекст, и тот списывал оценку за запрос,
+	// который вообще не был отправлен.
 	moderationTimeout = 3 * time.Minute
+
+	// ModerationPromptOverheadBytes — запас на системную инструкцию, обвязку
+	// промпта и схему инструмента, которых нет ни в вопросе, ни в протоколе.
+	// Экспортируется, чтобы обвязка могла отвергнуть бюджет, которого не хватает
+	// даже на пустые дебаты.
+	ModerationPromptOverheadBytes = 4096
 )
+
+// Сообщения протокола о деградации по бюджету. Читатель протокола обязан
+// отличать вердикт модели от вердикта по голосам, поэтому деградация всегда
+// оставляет след в протоколе, а не только в логах.
+const (
+	noticeBudgetSummary = "Бюджет модератора на эти дебаты исчерпан, " +
+		"дискуссия продолжается без промежуточного итога."
+	// Тексты вердикта различаются по режиму, потому что различается механизм:
+	// в hybrid исход определяют голоса участников, в moderator — нет.
+	noticeBudgetVerdictModerator = "Бюджет модератора на эти дебаты исчерпан, " +
+		"итог зафиксирован без вердикта модели."
+	noticeBudgetVerdictHybrid = "Бюджет модератора на эти дебаты исчерпан, " +
+		"итог подведён детерминированно по голосам участников."
+)
+
+// ModeratorBudget ограничивает суммарный расход LLM-модератора на одни дебаты.
+// Смысл потолка: стоимость одних дебатов должна быть конечной и известной
+// заранее, потому что дебаты после старта едут сами на дедлайнах ходов и не
+// требуют от инициатора ни одного запроса.
+type ModeratorBudget struct {
+	// DebateTokens — потолок суммарного расхода на одни дебаты в токенах.
+	// 0 или меньше отключает потолок (учёт расхода при этом продолжается).
+	DebateTokens int
+	// OutputPerCall — резерв на ответ модели, добавляемый к оценке каждого
+	// вызова. Должен совпадать с max_tokens, заданным провайдеру.
+	OutputPerCall int
+}
+
+// WithModeratorBudget задаёт потолок расхода LLM-модератора на одни дебаты.
+func WithModeratorBudget(budget ModeratorBudget) ServiceOption {
+	return func(service *Service) {
+		service.budget = budget
+	}
+}
 
 // Типичные ошибки бизнес-логики (транслируются в HTTP-статусы на уровне API).
 var (
@@ -52,18 +95,49 @@ type Storage interface {
 	Participants(debateID string) ([]Participant, error)
 	AddMessage(m Message) (int64, error)
 	Messages(debateID string, afterSeq int64) ([]Message, error)
+	// AddModeratorTokens увеличивает накопленный расход модератора на дебаты.
+	// Именно инкремент, а не запись значения: UpdateDebate пишет состояние из
+	// возможно устаревшей копии Debate и затёр бы уже учтённый расход.
+	AddModeratorTokens(debateID string, tokens int) error
 }
 
+// ModerationUsage — фактический расход одного вызова модератора в токенах.
+//
+// Billed означает «вызов вошёл в счёт владельца ключа»: ответ получен либо ждать
+// перестали мы сами. Запрос, не дошедший до провайдера, в счёт не входит, и
+// списывать за него оценку нельзя — иначе недоступность провайдера исчерпывала
+// бы бюджет дебатов, которые ничего не потратили.
+type ModerationUsage struct {
+	Billed       bool
+	InputTokens  int
+	OutputTokens int
+}
+
+// Total — суммарный расход вызова. Отрицательные значения от провайдера
+// отбрасываются: иначе ответ с усадкой вида {input: 1, output: -100} обнулял бы
+// списание и снимал потолок.
+func (u ModerationUsage) Total() int {
+	return max(u.InputTokens, 0) + max(u.OutputTokens, 0)
+}
+
+// Reported сообщает, известен ли фактический расход вызова.
+func (u ModerationUsage) Reported() bool { return u.Total() > 0 }
+
 // Moderator — серверный модератор дебатов.
+//
+// Каждый метод возвращает фактический расход вызова. Расход возвращается и
+// вместе с ошибкой: неудачный вызов тоже оплачен владельцем ключа, и
+// потерянный здесь расход дал бы способ тратить бюджет, не уменьшая его
+// (docs/adr/0004-moderator-spend-ceiling.md).
 type Moderator interface {
 	Name() string
 	// CheckRound подводит итог раунда и решает, достигнут ли консенсус
 	// (режим moderator).
-	CheckRound(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (RoundSummary, error)
+	CheckRound(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (RoundSummary, ModerationUsage, error)
 	// Summary подводит итог раунда без решения о консенсусе (режим hybrid).
-	Summary(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (RoundSummary, error)
+	Summary(ctx context.Context, question, transcript string, round int, allowedSeqs []int64) (RoundSummary, ModerationUsage, error)
 	// Verdict выносит финальное решение по всей дискуссии.
-	Verdict(ctx context.Context, question, transcript string, allowedSeqs []int64) (ModerationVerdict, error)
+	Verdict(ctx context.Context, question, transcript string, allowedSeqs []int64) (ModerationVerdict, ModerationUsage, error)
 }
 
 // Service — вся бизнес-логика дебатов. Потокобезопасен.
@@ -74,6 +148,7 @@ type Service struct {
 	log       *slog.Logger
 	now       func() time.Time
 	newID     func(string) string
+	budget    ModeratorBudget
 
 	// mu сериализует переходы состояний дебатов.
 	mu chan struct{} // семафор на 1 — mutex, совместимый с context
@@ -518,8 +593,6 @@ func (s *Service) advanceTurn(ctx context.Context, d Debate) error {
 // moderate подводит итог раунда. Запускается в отдельной горутине,
 // лок берёт только на запись результата.
 func (s *Service) moderate(ctx context.Context, debateID string) {
-	ctx, cancel := context.WithTimeout(ctx, moderationTimeout)
-	defer cancel()
 	d, err := s.store.GetDebate(debateID)
 	if err != nil {
 		s.log.Error("модерация: чтение дебатов", "debate", debateID, "err", err)
@@ -549,8 +622,23 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	} else if !lastRound {
 		if storedSummary != nil {
 			consensus = roundSummaryReachedConsensus(*storedSummary.RoundSummary)
+		} else if !s.moderationAllowed(d, subject(d), transcript) {
+			// Бюджет исчерпан: дискуссия продолжается без промежуточных итогов.
+			// Ходы участников сервису ничего не стоят, поэтому дебаты не рвутся
+			// на середине — они доедут до последнего раунда и завершатся
+			// детерминированным вердиктом.
+			s.log.Warn("модерация: бюджет дебатов исчерпан, итог раунда пропущен",
+				"debate", debateID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
+			if !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetSummary) {
+				s.lock()
+				_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, noticeBudgetSummary)
+				s.unlock()
+			}
 		} else {
-			summary, err := s.moderator.CheckRound(ctx, subject(d), transcript, d.CurrentRound, allowedSeqs)
+			callCtx, cancelCall := moderationCall(ctx)
+			summary, spent, err := s.moderator.CheckRound(callCtx, subject(d), transcript, d.CurrentRound, allowedSeqs)
+			cancelCall()
+			s.chargeModeration(&d, subject(d), transcript, spent)
 			s.lock()
 			if err != nil {
 				s.log.Error("модерация: итог раунда", "debate", debateID, "err", err)
@@ -578,26 +666,59 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 
 	if lastRound || consensus || storedVerdict != nil {
 		var verdict ModerationVerdict
-		if storedVerdict != nil {
+		degraded := false
+		switch {
+		case storedVerdict != nil:
 			verdict = *storedVerdict.Verdict
-		} else {
-			verdict, err = s.moderator.Verdict(ctx, subject(d), transcript, allowedSeqs)
+		case !s.moderationAllowed(d, subject(d), transcript):
+			// Деградация по бюджету: вердикта модели не будет. Консенсус остаётся
+			// тем, что определили оплаченные итоги раундов, и голоса участников в
+			// этом режиме на исход не влияют.
+			degraded = true
+			s.log.Warn("модерация: бюджет дебатов исчерпан, вердикт модели не запрашивается",
+				"debate", debateID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
+		default:
+			var spent ModerationUsage
+			callCtx, cancelCall := moderationCall(ctx)
+			verdict, spent, err = s.moderator.Verdict(callCtx, subject(d), transcript, allowedSeqs)
+			cancelCall()
+			s.chargeModeration(&d, subject(d), transcript, spent)
 		}
 		s.lock()
 		defer s.unlock()
-		if err != nil {
+		switch {
+		case degraded:
+			// consensus здесь остаётся тем, что определили оплаченные итоги
+			// раундов. Пересчитывать его по голосам нельзя: в режиме moderator
+			// голоса не являются механизмом консенсуса — участник, не указавший
+			// поддержку, считается голосующим за себя, — и подсчёт отдал бы исход
+			// чужих дебатов любому, кто в них вошёл.
+			degradedVerdict, verdictText := budgetExhaustedVerdict(consensus)
+			if !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetVerdictModerator) {
+				if _, err := s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, noticeBudgetVerdictModerator); err != nil {
+					s.log.Error("модерация: сохранение уведомления о бюджете", "debate", debateID, "err", err)
+					return
+				}
+			}
+			if _, err := s.appendVerdictText(debateID, d.CurrentRound, "система", degradedVerdict, verdictText); err != nil {
+				s.log.Error("модерация: сохранение детерминированного вердикта", "debate", debateID, "err", err)
+				return
+			}
+		case err != nil:
 			s.log.Error("модерация: вердикт", "debate", debateID, "err", err)
 			_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
 				"Модератор недоступен, дебаты завершены без вердикта.")
-		} else if storedVerdict == nil {
+		case storedVerdict == nil:
 			consensus = verdict.Consensus
 			if _, err := s.appendVerdict(debateID, d.CurrentRound, s.moderator.Name(), verdict); err != nil {
 				s.log.Error("модерация: сохранение вердикта", "debate", debateID, "err", err)
 				return
 			}
-		} else {
+		default:
 			consensus = verdict.Consensus
 		}
+		s.log.Info("расход модератора за дебаты", "debate", debateID,
+			"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens, "degraded", degraded)
 		d.Status = StatusConcluded
 		d.Consensus = consensus
 		d.TurnAgentID = ""
@@ -634,6 +755,131 @@ func roundSummaryReachedConsensus(summary RoundSummary) bool {
 	return summary.Consensus && len(summary.UnresolvedQuestions) == 0
 }
 
+// budgetExhaustedVerdict — детерминированный итог для режима moderator, когда
+// бюджет исчерпан до вердикта. Сохраняет определение консенсуса, данное
+// оплаченными итогами раундов, и намеренно не переносит в себя ни голоса, ни
+// текст участников: в этом режиме исход определяет модератор, а вердикт,
+// собранный из реплик, дал бы участникам способ вписать в протокол свой ответ.
+func budgetExhaustedVerdict(consensus bool) (ModerationVerdict, string) {
+	const answer = "Итог не сформулирован: бюджет модератора на эти дебаты исчерпан до вердикта."
+	var sb strings.Builder
+	sb.WriteString(answer)
+	sb.WriteString("\n\n")
+	if consensus {
+		sb.WriteString("Консенсус зафиксирован промежуточным итогом раунда до исчерпания бюджета.\n")
+	} else {
+		sb.WriteString("Консенсус не был зафиксирован ни одним промежуточным итогом.\n")
+	}
+	sb.WriteString("Протокол дискуссии сохранён полностью — выводы можно сделать по нему.\n")
+	// Пустые срезы, а не nil: эти поля уезжают в протокол и в экспорт, где все
+	// остальные производители вердикта дают [], и потребитель не обязан
+	// разбирать ещё и null.
+	return ModerationVerdict{
+		FinalAnswer:         answer,
+		Claims:              []ModerationClaim{},
+		UnresolvedQuestions: []string{},
+		Decisions:           []string{},
+		Consensus:           consensus,
+	}, sb.String()
+}
+
+// budgetNoticeRecorded сообщает, есть ли уже в протоколе уведомление о бюджете
+// за этот раунд. Повторная модерация после сбоя записи не должна дублировать
+// запись, на которой держится читаемость деградации.
+func budgetNoticeRecorded(msgs []Message, round int, notice string) bool {
+	for _, message := range msgs {
+		if message.Round == round && message.Kind == KindSystem && message.Text == notice {
+			return true
+		}
+	}
+	return false
+}
+
+// estimateModerationTokens — верхняя граница расхода одного вызова модератора,
+// вычисляемая до вызова из того, что сервис уже держит в руках.
+//
+// Считается один токен на байт. Это не средний расход, а именно верхняя
+// граница: byte-level BPE (Claude, cl100k/o200k) начинает с побайтового
+// разбиения и только склеивает пары, поэтому число токенов не превышает числа
+// байт ни на каком входе. Делить байты на средний коэффициент нельзя — реплики
+// пишет недоверенная сторона, и подобрать текст, который токенизируется хуже
+// среднего, ничего не стоит.
+//
+// Обычный текст расходует заметно меньше границы (кириллица в UTF-8 — около
+// пяти байт на токен, латиница около четырёх), поэтому потолок нужно выбирать с
+// запасом на этот коэффициент: см. docs/adr/0004-moderator-spend-ceiling.md.
+func (s *Service) estimateModerationTokens(question, transcript string) int {
+	return len(question) + len(transcript) + ModerationPromptOverheadBytes + s.budget.OutputPerCall
+}
+
+// MinimumViableBudget — потолок, ниже которого модерация не состоится вообще:
+// оценка любого вызова включает запас на промпт и на ответ модели, поэтому
+// меньший бюджет отвергает первый же вызов в каждых дебатах. Такой бюджет — это
+// отключение модерации под видом ограничения расхода, и обвязка обязана
+// отличать одно от другого.
+func (b ModeratorBudget) MinimumViableBudget() int {
+	return ModerationPromptOverheadBytes + b.OutputPerCall
+}
+
+// summaryCall — вызов промежуточного резюме с собственным дедлайном. Отдельная
+// функция потому, что вызов стоит в инициализаторе if и отменить контекст на
+// месте иначе некуда.
+func (s *Service) summaryCall(
+	ctx context.Context,
+	d Debate,
+	transcript string,
+	msgs []Message,
+) (RoundSummary, ModerationUsage, error) {
+	callCtx, cancelCall := moderationCall(ctx)
+	defer cancelCall()
+	return s.moderator.Summary(callCtx, subject(d), transcript, d.CurrentRound, messageSeqs(msgs))
+}
+
+// moderationCall даёт одному вызову модератора собственный дедлайн.
+func moderationCall(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, moderationTimeout)
+}
+
+// moderationAllowed сообщает, укладывается ли следующий вызов модератора в
+// остаток бюджета дебатов. Проверка до вызова, а не после: потолок обязан
+// предотвращать расход, а не обнаруживать его.
+func (s *Service) moderationAllowed(d Debate, question, transcript string) bool {
+	if s.budget.DebateTokens <= 0 {
+		return true
+	}
+	return d.ModeratorTokens+s.estimateModerationTokens(question, transcript) <= s.budget.DebateTokens
+}
+
+// chargeModeration списывает расход вызова с бюджета дебатов.
+//
+//   - вызов не вошёл в счёт — списывать нечего;
+//   - вошёл и расход сообщён — списывается фактический;
+//   - вошёл, а расхода в отчёте нет (провайдер его не вернул или мы перестали
+//     ждать ответ) — списывается верхняя граница. Считать такой вызов
+//     бесплатным нельзя: провайдер, не возвращающий usage, снимал бы потолок
+//     целиком, а медленный провайдер выдавал бы неучтённые вызовы.
+func (s *Service) chargeModeration(d *Debate, question, transcript string, spent ModerationUsage) {
+	if !spent.Billed {
+		return
+	}
+	charge := spent.Total()
+	if !spent.Reported() {
+		charge = s.estimateModerationTokens(question, transcript)
+	}
+	if charge <= 0 {
+		return
+	}
+	d.ModeratorTokens += charge
+	// Инкремент в хранилище, а не запись d: расход обязан переживать рестарт,
+	// иначе перезапуск машины выдавал бы дебатам свежий бюджет.
+	if err := s.store.AddModeratorTokens(d.ID, charge); err != nil {
+		s.log.Error("учёт расхода модератора", "debate", d.ID, "err", err)
+	}
+	s.log.Info("расход модератора", "debate", d.ID, "round", d.CurrentRound,
+		"tokens", charge, "reported", spent.Reported(),
+		"debate_total", d.ModeratorTokens, "budget", s.budget.DebateTokens)
+}
+
 // moderateHybrid — режим hybrid: консенсус определяют голоса участников
 // (единогласие активных спикеров), LLM-модератор опционален.
 func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
@@ -660,9 +906,19 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		// Промежуточное резюме — опциональный слой: без LLM просто едем дальше.
 		if storedSummary == nil {
 			transcript := renderTranscriptText(msgs)
-			if summary, err := s.moderator.Summary(ctx, subject(d), transcript, d.CurrentRound, messageSeqs(msgs)); err != nil {
+			if !s.moderationAllowed(d, subject(d), transcript) {
+				s.log.Warn("гибрид: бюджет дебатов исчерпан, резюме пропущено",
+					"debate", d.ID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
+				if !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetSummary) {
+					s.lock()
+					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, noticeBudgetSummary)
+					s.unlock()
+				}
+			} else if summary, spent, err := s.summaryCall(ctx, d, transcript, msgs); err != nil {
+				s.chargeModeration(&d, subject(d), transcript, spent)
 				s.log.Warn("гибрид: резюме раунда недоступно", "debate", d.ID, "err", err)
 			} else {
+				s.chargeModeration(&d, subject(d), transcript, spent)
 				// In hybrid mode only participant votes decide consensus. Preserve that
 				// invariant even if a provider ignores the structured prompt.
 				summary.Consensus = false
@@ -694,16 +950,28 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	var verdict ModerationVerdict
 	verdictText := ""
 	speaker := s.moderator.Name()
-	if storedVerdict != nil {
+	budgetExhausted := false
+	switch transcript := renderTranscriptText(msgs); {
+	case storedVerdict != nil:
 		verdict = *storedVerdict.Verdict
 		verdictText = storedVerdict.Text
 		speaker = storedVerdict.SpeakerName
-	} else {
-		verdict, err = s.moderator.Verdict(ctx, subject(d), renderTranscriptText(msgs), messageSeqs(msgs))
+	case !s.moderationAllowed(d, subject(d), transcript):
+		s.log.Warn("гибрид: бюджет дебатов исчерпан, вердикт по голосам",
+			"debate", d.ID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
+		budgetExhausted = true
+		verdict, verdictText = hybridVerdict(votes, msgs, consensus, false)
+		speaker = "система"
+	default:
+		var spent ModerationUsage
+		callCtx, cancelCall := moderationCall(ctx)
+		verdict, spent, err = s.moderator.Verdict(callCtx, subject(d), transcript, messageSeqs(msgs))
+		cancelCall()
+		s.chargeModeration(&d, subject(d), transcript, spent)
 		verdictText = verdict.Text()
 		if err != nil {
 			s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)
-			verdict, verdictText = hybridVerdict(votes, msgs, consensus)
+			verdict, verdictText = hybridVerdict(votes, msgs, consensus, true)
 			speaker = "система"
 		}
 	}
@@ -713,11 +981,19 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	s.lock()
 	defer s.unlock()
 	if storedVerdict == nil {
+		if budgetExhausted && !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetVerdictHybrid) {
+			if _, err := s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, noticeBudgetVerdictHybrid); err != nil {
+				s.log.Error("гибрид: сохранение уведомления о бюджете", "debate", d.ID, "err", err)
+				return
+			}
+		}
 		if _, err := s.appendVerdictText(d.ID, d.CurrentRound, speaker, verdict, verdictText); err != nil {
 			s.log.Error("гибрид: сохранение вердикта", "debate", d.ID, "err", err)
 			return
 		}
 	}
+	s.log.Info("расход модератора за дебаты", "debate", d.ID,
+		"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens, "degraded", budgetExhausted)
 	d.Status = StatusConcluded
 	d.Consensus = consensus
 	d.TurnAgentID = ""
@@ -778,7 +1054,15 @@ func unanimity(votes []Vote) bool {
 }
 
 // hybridVerdict — детерминированный вердикт по голосам, когда LLM недоступен.
-func hybridVerdict(votes []Vote, msgs []Message, consensus bool) (ModerationVerdict, string) {
+// hybridVerdict собирает детерминированный итог по голосам участников.
+//
+// quoteLeader управляет тем, попадает ли в итог дословная реплика лидера
+// голосования. При недоступности модератора — да: это лучший доступный ответ на
+// вопрос дебатов, и триггер выбрал не участник. При исчерпании бюджета — нет:
+// исчерпать бюджет может любой, кто вошёл в дебаты и пишет длинные реплики, а
+// это дало бы участнику способ гарантированно вписать свой текст в итог чужой
+// дискуссии (docs/adr/0004-moderator-spend-ceiling.md).
+func hybridVerdict(votes []Vote, msgs []Message, consensus, quoteLeader bool) (ModerationVerdict, string) {
 	var sb strings.Builder
 	if consensus {
 		sb.WriteString("Консенсус достигнут голосованием участников.\n\n")
@@ -808,8 +1092,14 @@ func hybridVerdict(votes []Vote, msgs []Message, consensus bool) (ModerationVerd
 				name, text = m.SpeakerName, m.Text // последняя реплика победителя
 			}
 		}
-		if text != "" {
+		switch {
+		case text != "" && quoteLeader:
 			fmt.Fprintf(&sb, "\nНаибольшую поддержку получила позиция участника %s (голосов: %d).\nЕго итоговая реплика:\n\n%s\n", name, bestCount, text)
+		case text != "":
+			// Идентификатор, а не отображаемое имя: имя задаёт участник, а
+			// исчерпать бюджет может любой из них, и через имя в итог чужой
+			// дискуссии уехал бы произвольный текст.
+			fmt.Fprintf(&sb, "\nНаибольшую поддержку получила позиция участника %s (голосов: %d).\nЕё изложение — в протоколе дискуссии.\n", best, bestCount)
 		}
 	} else if len(tally) > 0 {
 		sb.WriteString("\nГолоса разделились поровну — итоговая позиция не определена.\n")

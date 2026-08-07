@@ -402,6 +402,62 @@ func assertLegacyState(t *testing.T, st *Store, createdAt time.Time) {
 
 }
 
+// TestModeratorTokensAccumulateAndSurviveDebateWrites охраняет носитель потолка
+// расхода: счётчик увеличивается только инкрементом, и UpdateDebate,
+// записывающий состояние из возможно устаревшей копии Debate, не имеет права его
+// затирать — иначе очередной ход дебатов возвращал бы им уже потраченный бюджет
+// (docs/adr/0004-moderator-spend-ceiling.md).
+func TestModeratorTokensAccumulateAndSurviveDebateWrites(t *testing.T) {
+	st := openTestStore(t)
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	agent := core.Agent{ID: "agt_owner", Name: "Owner", CreatedAt: now}
+	if err := st.CreateAgent(agent, core.Credential{ID: "crd_owner", AgentID: agent.ID, CreatedAt: now}, "hash-owner"); err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+	debate := core.Debate{
+		ID: "dbt_spend", Question: "Нужен ли потолок?", Mode: core.ModeModerator,
+		Status: core.StatusRunning, Rounds: 3, CurrentRound: 1, TurnTimeout: 60,
+		CreatorID: agent.ID, CreatedAt: now,
+	}
+	if err := st.CreateDebate(debate); err != nil {
+		t.Fatalf("CreateDebate: %v", err)
+	}
+	if stored, err := st.GetDebate(debate.ID); err != nil || stored.ModeratorTokens != 0 {
+		t.Fatalf("новые дебаты стартуют с расходом %d, err = %v", stored.ModeratorTokens, err)
+	}
+
+	for _, tokens := range []int{4_000, 6_500} {
+		if err := st.AddModeratorTokens(debate.ID, tokens); err != nil {
+			t.Fatalf("AddModeratorTokens(%d): %v", tokens, err)
+		}
+	}
+	if stored, err := st.GetDebate(debate.ID); err != nil || stored.ModeratorTokens != 10_500 {
+		t.Fatalf("накопленный расход = %d, ожидалось 10500, err = %v", stored.ModeratorTokens, err)
+	}
+
+	// Устаревшая копия: прочитана до списаний и ничего о них не знает.
+	stale := debate
+	stale.CurrentRound = 2
+	if err := st.UpdateDebate(stale); err != nil {
+		t.Fatalf("UpdateDebate: %v", err)
+	}
+	stored, err := st.GetDebate(debate.ID)
+	if err != nil {
+		t.Fatalf("GetDebate после UpdateDebate: %v", err)
+	}
+	if stored.ModeratorTokens != 10_500 {
+		t.Fatalf("расход после записи состояния = %d, ожидалось 10500 — UpdateDebate затирает счётчик",
+			stored.ModeratorTokens)
+	}
+	if stored.CurrentRound != 2 {
+		t.Fatalf("UpdateDebate не записал раунд: %d", stored.CurrentRound)
+	}
+
+	if err := st.AddModeratorTokens("dbt_missing", 100); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("списание на несуществующие дебаты: err = %v, ожидалась ErrNotFound", err)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	st, err := Open(filepath.Join(t.TempDir(), "court.db"))
@@ -559,8 +615,12 @@ func legacySchemaFingerprint(t *testing.T, db *sql.DB) string {
 			if err := rows.Scan(&cid, &column.Name, &column.Type, &column.NotNull, &defaultValue, &column.PrimaryKey); err != nil {
 				t.Fatalf("scan table_info(%s): %v", table, err)
 			}
-			if column.Name == "moderation_json" {
-				continue // intentional v1 addition
+			// Умышленные additive-миграции: колонка добавлена с DEFAULT, поэтому
+			// прежний бинарь продолжает писать в таблицу и откат остаётся
+			// исполнимым. Отпечаток охраняет обратное — что миграция не меняет и
+			// не удаляет то, что было в legacy-схеме.
+			if column.Name == "moderation_json" || column.Name == "moderator_tokens" {
+				continue
 			}
 			column.Default, column.HasDefault = defaultValue.String, defaultValue.Valid
 			tableShape.Columns = append(tableShape.Columns, column)

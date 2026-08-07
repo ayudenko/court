@@ -35,41 +35,45 @@ type countingModerator struct {
 	mu             sync.Mutex
 	checkConsensus bool
 	verdictErr     bool
-	checks         int
-	summaries      int
-	verdicts       int
+	// usage — расход, который фейк сообщает на каждый вызов. Нулевое значение
+	// означает «вызов не вошёл в счёт», и сервис не списывает за него ничего;
+	// «ответ без расхода» — это Billed: true с нулевыми токенами.
+	usage     core.ModerationUsage
+	checks    int
+	summaries int
+	verdicts  int
 }
 
 func (*countingModerator) Name() string { return "counting moderator" }
 
 func (m *countingModerator) CheckRound(
 	context.Context, string, string, int, []int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
 	m.mu.Lock()
 	m.checks++
 	m.mu.Unlock()
-	return core.RoundSummary{Summary: "Counted summary.", Consensus: m.checkConsensus}, nil
+	return core.RoundSummary{Summary: "Counted summary.", Consensus: m.checkConsensus}, m.usage, nil
 }
 
 func (m *countingModerator) Summary(
 	context.Context, string, string, int, []int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
 	m.mu.Lock()
 	m.summaries++
 	m.mu.Unlock()
-	return core.RoundSummary{Summary: "Counted hybrid summary.", Consensus: false}, nil
+	return core.RoundSummary{Summary: "Counted hybrid summary.", Consensus: false}, m.usage, nil
 }
 
 func (m *countingModerator) Verdict(
 	context.Context, string, string, []int64,
-) (core.ModerationVerdict, error) {
+) (core.ModerationVerdict, core.ModerationUsage, error) {
 	m.mu.Lock()
 	m.verdicts++
 	m.mu.Unlock()
 	if m.verdictErr {
-		return core.ModerationVerdict{}, errors.New("injected moderator fallback")
+		return core.ModerationVerdict{}, m.usage, errors.New("injected moderator fallback")
 	}
-	return core.ModerationVerdict{FinalAnswer: "Counted verdict.", Consensus: m.checkConsensus}, nil
+	return core.ModerationVerdict{FinalAnswer: "Counted verdict.", Consensus: m.checkConsensus}, m.usage, nil
 }
 
 func (m *countingModerator) calls() (checks, summaries, verdicts int) {
@@ -142,13 +146,13 @@ func (m *blockingConsensusModerator) CheckRound(
 	transcript string,
 	round int,
 	allowedSeqs []int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
 	m.startedOnce.Do(func() { close(m.started) })
 	select {
 	case <-m.release:
 		return m.consensusModerator.CheckRound(ctx, question, transcript, round, allowedSeqs)
 	case <-ctx.Done():
-		return core.RoundSummary{}, ctx.Err()
+		return core.RoundSummary{}, core.ModerationUsage{}, ctx.Err()
 	}
 }
 
@@ -162,12 +166,12 @@ func (unresolvedConsensusModerator) CheckRound(
 	string,
 	int,
 	[]int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
 	return core.RoundSummary{
 		Summary:             "One question remains open.",
 		UnresolvedQuestions: []string{"Which option should be chosen?"},
 		Consensus:           true,
-	}, nil
+	}, core.ModerationUsage{}, nil
 }
 
 func (consensusSummaryModerator) Summary(
@@ -176,8 +180,9 @@ func (consensusSummaryModerator) Summary(
 	string,
 	int,
 	[]int64,
-) (core.RoundSummary, error) {
-	return core.RoundSummary{Summary: "Provider incorrectly claims consensus.", Consensus: true}, nil
+) (core.RoundSummary, core.ModerationUsage, error) {
+	return core.RoundSummary{Summary: "Provider incorrectly claims consensus.", Consensus: true},
+		core.ModerationUsage{}, nil
 }
 
 func (unavailableVerdictModerator) Verdict(
@@ -185,8 +190,8 @@ func (unavailableVerdictModerator) Verdict(
 	string,
 	string,
 	[]int64,
-) (core.ModerationVerdict, error) {
-	return core.ModerationVerdict{}, errors.New("moderator unavailable")
+) (core.ModerationVerdict, core.ModerationUsage, error) {
+	return core.ModerationVerdict{}, core.ModerationUsage{}, errors.New("moderator unavailable")
 }
 
 func (consensusModerator) Name() string { return "test moderator" }
@@ -197,12 +202,12 @@ func (consensusModerator) CheckRound(
 	string,
 	int,
 	[]int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
 	return core.RoundSummary{
 		Summary:   "The tested invariants hold.",
 		Decisions: []string{"Conclude the debate."},
 		Consensus: true,
-	}, nil
+	}, core.ModerationUsage{}, nil
 }
 
 func (consensusModerator) Summary(
@@ -211,8 +216,8 @@ func (consensusModerator) Summary(
 	string,
 	int,
 	[]int64,
-) (core.RoundSummary, error) {
-	return core.RoundSummary{}, errors.New("unexpected hybrid summary")
+) (core.RoundSummary, core.ModerationUsage, error) {
+	return core.RoundSummary{}, core.ModerationUsage{}, errors.New("unexpected hybrid summary")
 }
 
 func (consensusModerator) Verdict(
@@ -220,12 +225,12 @@ func (consensusModerator) Verdict(
 	string,
 	string,
 	[]int64,
-) (core.ModerationVerdict, error) {
+) (core.ModerationVerdict, core.ModerationUsage, error) {
 	return core.ModerationVerdict{
 		FinalAnswer: "Consensus reached.",
 		Decisions:   []string{"Keep the agreed position."},
 		Consensus:   true,
-	}, nil
+	}, core.ModerationUsage{}, nil
 }
 
 func TestDebateStateMachineReachesConsensus(t *testing.T) {

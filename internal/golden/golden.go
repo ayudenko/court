@@ -306,7 +306,9 @@ func (moderator scriptedModerator) CheckRound(
 	_ string,
 	_ int,
 	allowedSeqs []int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
+	// Расход не сообщается и вызов не помечен оплаченным: golden-трассы фиксируют
+	// протокол, а не стоимость, поэтому бюджет здесь не расходуется вовсе.
 	return core.RoundSummary{
 		Summary: "The fixture inputs and protocol invariants are reproducible.",
 		Claims: []core.ModerationClaim{{
@@ -315,7 +317,7 @@ func (moderator scriptedModerator) CheckRound(
 		UnresolvedQuestions: []string{},
 		Decisions:           []string{"Regenerate fixtures through one command."},
 		Consensus:           moderator.consensus,
-	}, nil
+	}, core.ModerationUsage{}, nil
 }
 
 func (moderator scriptedModerator) Summary(
@@ -324,7 +326,7 @@ func (moderator scriptedModerator) Summary(
 	transcript string,
 	round int,
 	allowedSeqs []int64,
-) (core.RoundSummary, error) {
+) (core.RoundSummary, core.ModerationUsage, error) {
 	return moderator.CheckRound(ctx, question, transcript, round, allowedSeqs)
 }
 
@@ -333,7 +335,7 @@ func (moderator scriptedModerator) Verdict(
 	_ string,
 	_ string,
 	allowedSeqs []int64,
-) (core.ModerationVerdict, error) {
+) (core.ModerationVerdict, core.ModerationUsage, error) {
 	return core.ModerationVerdict{
 		FinalAnswer: "Use deterministic record/replay fixtures as protocol evidence.",
 		Claims: []core.ModerationClaim{{
@@ -342,5 +344,5 @@ func (moderator scriptedModerator) Verdict(
 		UnresolvedQuestions: []string{},
 		Decisions:           []string{"Keep record and replay on the canonical v1 schema."},
 		Consensus:           moderator.consensus,
-	}, nil
+	}, core.ModerationUsage{}, nil
 }

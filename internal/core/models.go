@@ -84,6 +84,10 @@ type Debate struct {
 	TurnDeadline time.Time    `json:"-"`
 	Consensus    bool         `json:"consensus"`
 	CreatedAt    time.Time    `json:"created_at"`
+	// ModeratorTokens — накопленный расход LLM-модератора на эти дебаты.
+	// Вне протокола (`json:"-"`): это операционная метрика владельца ключа, а не
+	// факт дискуссии, и версионированная схема v1 её не содержит.
+	ModeratorTokens int `json:"-"`
 }
 
 // Participant — агент, присоединившийся к дебатам.

@@ -11,6 +11,14 @@
 //	                          ANTHROPIC_API_KEY / OPENAI_API_KEY
 //	COURT_MODERATOR_NAME      отображаемое имя (по умолчанию «Модератор»)
 //
+// Потолок расхода модератора, см. docs/adr/0004-moderator-spend-ceiling.md:
+//
+//	COURT_MODERATOR_DEBATE_TOKEN_BUDGET  потолок расхода LLM-модератора на одни
+//	                                     дебаты в токенах, см.
+//	                                     defaultDebateTokenBudget. 0 снимает
+//	                                     потолок: стоимость одних дебатов
+//	                                     становится неограниченной.
+//
 // Лимиты (0 отключает лимит), см. docs/adr/0003-http-rate-limiting.md:
 //
 //	COURT_CLIENT_IP_HEADER          заголовок с адресом клиента от доверенного
@@ -54,6 +62,22 @@ import (
 
 const version = "0.2.0"
 
+// moderatorMaxOutputTokens — max_tokens одного вызова модератора. Тот же
+// потолок резервируется в оценке расхода до вызова, поэтому значение общее для
+// провайдера и бюджета: разъехавшись, они превратили бы оценку в фикцию.
+const moderatorMaxOutputTokens = 4096
+
+// defaultDebateTokenBudget — потолок расхода модератора на одни дебаты.
+//
+// Допуск вызова считается по верхней границе «один токен на байт», поэтому
+// потолок нужно читать вместе с запасом на реальную токенизацию: кириллица даёт
+// около пяти байт на токен. Умолчание выбрано так, чтобы без деградации
+// проходили дебаты на 10 раундов с 5 участниками и репликами по 2000 символов
+// (фактический расход такой дискуссии — порядка 200 000 токенов), а дебаты с
+// репликами по границе MaxArgumentLen обрывались на третьем раунде.
+// Расчёт и обоснование — docs/adr/0004-moderator-spend-ceiling.md.
+const defaultDebateTokenBudget = 500_000
+
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
@@ -77,7 +101,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	svc := core.NewService(st, core.NewHub(), mod, log)
+	svc, err := buildService(st, mod, log)
+	if err != nil {
+		log.Error("настройка сервиса", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -170,6 +198,35 @@ func buildHandler(svc *core.Service, limiter *ratelimit.Limiter, log *slog.Logge
 	return mux
 }
 
+// buildService собирает ядро вместе с потолком расхода модератора. Отдельная
+// функция по той же причине, что и buildHandler: потолок, незаметно потерянный
+// при сборке сервиса, не ломает ни один функциональный путь — он просто
+// перестаёт существовать, поэтому тест обязан проверять именно эту обвязку.
+func buildService(st core.Storage, mod core.Moderator, log *slog.Logger) (*core.Service, error) {
+	debateTokens, err := envInt("COURT_MODERATOR_DEBATE_TOKEN_BUDGET", defaultDebateTokenBudget)
+	if err != nil {
+		return nil, err
+	}
+	budget := core.ModeratorBudget{
+		DebateTokens:  debateTokens,
+		OutputPerCall: moderatorMaxOutputTokens,
+	}
+	switch minimum := budget.MinimumViableBudget(); {
+	case budget.DebateTokens == 0:
+		log.Warn("COURT_MODERATOR_DEBATE_TOKEN_BUDGET=0 — потолок расхода модератора снят; " +
+			"стоимость одних дебатов ничем не ограничена")
+	case budget.DebateTokens <= minimum:
+		// Такой бюджет отвергает первый же вызов в каждых дебатах. Это отключение
+		// модерации, а не ограничение расхода, и молча стартовать с ним нельзя.
+		return nil, fmt.Errorf(
+			"COURT_MODERATOR_DEBATE_TOKEN_BUDGET=%d отвергает любой вызов модератора: "+
+				"нужно больше %d либо 0, чтобы снять потолок", budget.DebateTokens, minimum)
+	}
+	log.Info("потолок расхода модератора настроен",
+		"debate_token_budget", budget.DebateTokens, "output_per_call", budget.OutputPerCall)
+	return core.NewService(st, core.NewHub(), mod, log, core.WithModeratorBudget(budget)), nil
+}
+
 func buildModerator(log *slog.Logger) (core.Moderator, error) {
 	providerName := envOr("COURT_MODERATOR_PROVIDER", "anthropic")
 	model := envOr("COURT_MODERATOR_MODEL", "claude-opus-5")
@@ -184,12 +241,12 @@ func buildModerator(log *slog.Logger) (core.Moderator, error) {
 		if apiKey == "" && os.Getenv("ANTHROPIC_API_KEY") == "" {
 			log.Warn("ключ модератора не задан (COURT_MODERATOR_API_KEY / ANTHROPIC_API_KEY) — модерация будет недоступна")
 		}
-		provider = llm.NewAnthropicProvider(apiKey, model, 4096)
+		provider = llm.NewAnthropicProvider(apiKey, model, moderatorMaxOutputTokens)
 	case "openai":
 		if apiKey == "" && os.Getenv("OPENAI_API_KEY") == "" {
 			log.Warn("ключ модератора не задан (COURT_MODERATOR_API_KEY / OPENAI_API_KEY) — модерация будет недоступна")
 		}
-		provider = llm.NewOpenAICompatProvider(apiKey, os.Getenv("COURT_MODERATOR_BASE_URL"), model, 4096)
+		provider = llm.NewOpenAICompatProvider(apiKey, os.Getenv("COURT_MODERATOR_BASE_URL"), model, moderatorMaxOutputTokens)
 	default:
 		return nil, errors.New("COURT_MODERATOR_PROVIDER: ожидается anthropic или openai")
 	}
