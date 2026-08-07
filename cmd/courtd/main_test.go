@@ -158,6 +158,12 @@ func TestShippedDefaultsAreEnforcedByTheProductionHandler(t *testing.T) {
 		close()
 		t.Fatalf("stream past the default allowance: status = %d, want 429", status)
 	}
+	// Экспорт делит тот же бюджет адреса. Это самый дорогой читающий маршрут и
+	// при этом неаутентифицированный: собственная квота у него означала бы, что
+	// потолок одновременных подключений обходится сменой маршрута.
+	if status := getExport(mux, debateID, "192.0.2.50"); status != http.StatusTooManyRequests {
+		t.Fatalf("export past the default stream allowance: status = %d, want 429", status)
+	}
 }
 
 // TestMcpStreamsAreChargedByTheTransport: /mcp has long-lived methods beyond
@@ -365,6 +371,14 @@ func debateIDFrom(t *testing.T, mux *http.ServeMux, key string) string {
 
 // openEvents opens an SSE stream and leaves it open until the returned closer
 // runs, so the slot it holds is observable.
+func getExport(mux *http.ServeMux, debateID, clientIP string) int {
+	request := httptest.NewRequest(http.MethodGet, "/api/debates/"+debateID+"/export", nil)
+	request.Header.Set("Fly-Client-IP", clientIP)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	return recorder.Code
+}
+
 func openEvents(mux *http.ServeMux, debateID, clientIP string) (int, func()) {
 	request := httptest.NewRequest(http.MethodGet, "/api/debates/"+debateID+"/events", nil)
 	request.Header.Set("Fly-Client-IP", clientIP)

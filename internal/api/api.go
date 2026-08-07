@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"court/internal/core"
+	"court/internal/protocol"
 	"court/internal/ratelimit"
 	"court/internal/store"
 )
@@ -20,12 +22,96 @@ import (
 // MaxWaitSec — потолок long-poll ожидания очереди.
 const MaxWaitSec = 120
 
+const (
+	// MaxConcurrentExports — потолок одновременных экспортов на процесс.
+	//
+	// Это ограничение памяти, а не политика клиента: один экспорт держит
+	// протокол дебатов и его JSONL-представление одновременно, а слот на адрес
+	// такую сумму не ограничивает — адресов у нападающего столько, сколько
+	// разрешит фронт. Выведен из MaxExportBytes: столько артефактов предельного
+	// размера процесс переживает одновременно.
+	MaxConcurrentExports = 4
+	// MaxExportBytes — верхняя оценка одного артефакта, из которой выведен
+	// потолок. Считается по собственным лимитам сервиса: MaxParticipants раз
+	// MaxRounds реплик по MaxArgumentLen байт, каждый из которых в худшем случае
+	// управляющий и уезжает в JSON шестью символами, плюс модерация и обвязка
+	// записей. Добавление полей в записи требует пересчитать обе константы, а не
+	// унаследовать их.
+	MaxExportBytes = 16 << 20
+	// exportsPerAddress — доля потолка, доступная одному адресу.
+	//
+	// Потолок общий, поэтому без доли одного адреса с MaxConcurrentExports
+	// переставшими читать соединениями хватает, чтобы маршрут отвечал 503 всем
+	// остальным, — и отказ ничего не стоит, поэтому освободившийся слот снова
+	// достаётся тому, кто чаще спрашивает. Доля не делает атаку невозможной, но
+	// перестаёт отдавать весь маршрут одному соединению.
+	exportsPerAddress = MaxConcurrentExports / 2
+	// defaultSlowExportThreshold — порог, выше которого сборка попадает в лог
+	// как наблюдаемый признак того, что артефакт перерос маршрут.
+	defaultSlowExportThreshold = 2 * time.Second
+	// exportWriteTimeout — предел на запись готового артефакта.
+	//
+	// Слот потолка держится до конца записи, иначе он не ограничивает память:
+	// собранные байты живут, пока их не отдали. Значит, у записи обязан быть
+	// предел, иначе соединение, переставшее читать, занимает слот навсегда.
+	// Обрыв по этому пределу не может притвориться короткими дебатами: ответ
+	// объявляет Content-Length, и клиент увидит недочитанное тело.
+	//
+	// Значение — компромисс: предел ограничивает и то, как долго переставшие
+	// читать соединения держат маршрут занятым, и то, насколько медленному
+	// клиенту хватит времени забрать предельный по размеру артефакт.
+	exportWriteTimeout = 30 * time.Second
+	// exportRetryAfterSec — подсказка клиенту, отвергнутому потолком. Названо
+	// худшее время удержания слота, а не типичное: сборка занимает миллисекунды,
+	// но слот освобождается только по завершении записи, и подсказка «через 5 с»
+	// была бы ложью ровно в том случае, ради которого она нужна.
+	exportRetryAfterSec = int(exportWriteTimeout / time.Second)
+)
+
 // Server — REST-обвязка над ядром.
 type Server struct {
 	svc               *core.Service
 	log               *slog.Logger
 	limiter           *ratelimit.Limiter
 	heartbeatInterval time.Duration
+	exports           chan struct{}
+	exportsByAddress  addressShare
+	slowExport        time.Duration
+	deadlineWarning   sync.Once
+}
+
+// addressShare считает занятые слоты по адресам. Живёт здесь, а не в лимитере:
+// делится ресурс процесса, а не бюджет клиента, и общий потолок остаётся
+// авторитетом. Записей не больше числа одновременных экспортов, поэтому таблица
+// не растёт и чистить её нечем — слот удаляется вместе с последним держателем.
+type addressShare struct {
+	mu    sync.Mutex
+	held  map[string]int
+	limit int
+}
+
+func (s *addressShare) acquire(address string) (release func(), ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.held[address] >= s.limit {
+		return func() {}, false
+	}
+	if s.held == nil {
+		s.held = make(map[string]int, MaxConcurrentExports)
+	}
+	s.held[address]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.held[address] <= 1 {
+				delete(s.held, address)
+				return
+			}
+			s.held[address]--
+		})
+	}, true
 }
 
 // New создаёт сервер API. Нулевой limiter означает «без лимитов».
@@ -33,7 +119,12 @@ func New(svc *core.Service, log *slog.Logger, limiter *ratelimit.Limiter) *Serve
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{svc: svc, log: log, limiter: limiter, heartbeatInterval: 25 * time.Second}
+	return &Server{
+		svc: svc, log: log, limiter: limiter, heartbeatInterval: 25 * time.Second,
+		exports:          make(chan struct{}, MaxConcurrentExports),
+		exportsByAddress: addressShare{limit: exportsPerAddress},
+		slowExport:       defaultSlowExportThreshold,
+	}
 }
 
 // Routes регистрирует маршруты API на mux.
@@ -54,6 +145,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/debates/{id}", s.handleGetDebate)
 	mux.HandleFunc("DELETE /api/debates/{id}", s.auth(s.handleDeleteDebate))
 	mux.HandleFunc("GET /api/debates/{id}/messages", s.handleMessages)
+	mux.HandleFunc("GET /api/debates/{id}/export", s.limitIPStream(s.handleExport))
 	mux.HandleFunc("POST /api/debates/{id}/join", s.auth(s.handleJoin))
 	mux.HandleFunc("POST /api/debates/{id}/start", s.auth(s.handleStart))
 	mux.HandleFunc("GET /api/debates/{id}/turn", s.auth(s.limitAgentStream(s.handleTurn)))
@@ -304,6 +396,132 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+}
+
+// handleExport отдаёт дебаты как канонический версионированный JSONL-поток —
+// тот же артефакт, что лежит в golden-трассах (docs/adr/0002-protocol-schema-v1.md,
+// docs/adr/0006-debate-export-endpoint.md).
+//
+// Аутентификации нет намеренно: экспорт — это композиция двух уже публичных
+// чтений, состояния и протокола, собранная из того же представления дебатов.
+// Всё, что скрывает публичное чтение, скрывает и экспорт. Зато лимиты нужны
+// оба: слот на адрес — за честность между клиентами, потолок на процесс — за
+// память, потому что слот на адрес её не ограничивает.
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	debateID := r.PathValue("id")
+	clientIP := s.limiter.ClientIP(r)
+	releaseAddress, ok := s.exportsByAddress.acquire(clientIP)
+	if !ok {
+		s.refuseExport(w, clientIP)
+		return
+	}
+	defer releaseAddress()
+	select {
+	case s.exports <- struct{}{}:
+		defer func() { <-s.exports }()
+	default:
+		// Отказ сразу, а не очередь: очередь на неаутентифицированном маршруте
+		// — это тот же расход памяти, только отложенный.
+		s.refuseExport(w, clientIP)
+		return
+	}
+
+	readStarted := time.Now()
+	snapshot, err := s.svc.ExportSnapshot(r.Context(), debateID)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Клиент ушёл, пока запрос ждал очереди, — не событие оператора.
+			// Но статус обязан быть явным: молчаливый возврат отдал бы неявный
+			// 200 с пустым телом, то есть успешный экспорт из нуля записей.
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "экспорт прерван"})
+			return
+		}
+		s.failExport(w, "экспорт: чтение дебатов", debateID, err)
+		return
+	}
+	read := time.Since(readStarted)
+
+	encodeStarted := time.Now()
+	records, err := protocol.Stream(snapshot)
+	if err != nil {
+		s.failExport(w, "экспорт: сборка потока", debateID, err)
+		return
+	}
+	// Артефакт кодируется целиком до первого записанного байта: потоковая
+	// запись, отказавшая на середине, уже отдала бы 200 и префикс записей, а
+	// оборванный JSONL неотличим от коротких дебатов. Объём ограничен лимитами
+	// сервиса на участников, раунды и длину реплики.
+	data, err := protocol.MarshalJSONL(records)
+	if err != nil {
+		s.failExport(w, "экспорт: сериализация потока", debateID, err)
+		return
+	}
+	// Чтение и кодирование измеряются раздельно: чтение включает ожидание
+	// замка переходов, и без разделения медленный чужой писатель выглядел бы
+	// как разросшийся артефакт. Логируется только превышение порога, поэтому
+	// поток запросов не может утопить сигнал отказа лимитера.
+	if encode := time.Since(encodeStarted); read >= s.slowExport || encode >= s.slowExport {
+		s.log.Warn("экспорт: медленная сборка", "debate", debateID,
+			"read_ms", read.Milliseconds(), "encode_ms", encode.Milliseconds(), "bytes", len(data))
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", debateID+".jsonl"))
+	// Артефакт содержит текст участников как есть: отдавать его на угадывание
+	// типа браузеру незачем.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Длина объявляется, поэтому оборванная запись остаётся оборванной записью,
+	// а не превращается в короткие, но правдоподобные дебаты.
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	// Предел на запись: слот потолка держится до её конца, и клиент, переставший
+	// читать, иначе занимает его навсегда.
+	//
+	// Предел снимается после записи явно. Он ставится на соединение, а не на
+	// запрос; текущий net/http снимает его сам в конце запроса, но единственная
+	// граница, ограничивающая удержание слота, не должна зависеть от чужой
+	// детали реализации: оставленный предел оборвал бы следующий ответ на том же
+	// keep-alive соединении — чужой маршрут, чужой клиент, ни строки в логе.
+	//
+	// ResponseWriter без поддержки предела — не повод отказывать в ответе, но и
+	// не мелочь: обёртка без Unwrap молча снимет единственную границу удержания.
+	// Поэтому один раз на процесс это попадает в лог.
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(exportWriteTimeout)); err != nil {
+		s.deadlineWarning.Do(func() {
+			s.log.Error("экспорт: предел на запись недоступен, слот потолка удерживается без границы", "err", err)
+		})
+	}
+	defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
+	w.WriteHeader(http.StatusOK)
+	// Обрыв соединения клиентом — не событие оператора: writeJSON на остальных
+	// маршрутах молчит по той же причине.
+	_, _ = w.Write(data)
+}
+
+// refuseExport отвечает на исчерпанный потолок — общий или долю адреса.
+// Логируется той же выборкой, что и отказы лимитера: иначе исчерпанный потолок
+// выглядит как недоступность маршрута вообще, без следа на сервере, и критерию
+// отката ADR 0006 стрелять не по чему.
+func (s *Server) refuseExport(w http.ResponseWriter, clientIP string) {
+	s.limiter.LogRefusal(ratelimit.ScopeExportCeiling, clientIP)
+	w.Header().Set("Retry-After", strconv.Itoa(exportRetryAfterSec))
+	writeJSON(w, http.StatusServiceUnavailable,
+		map[string]string{"error": "экспорт занят, повторите запрос"})
+}
+
+// failExport логирует сбой экспорта и отвечает, не пересказывая клиенту
+// внутреннюю ошибку. Логируется только то, что клиент не мог вызвать сам:
+// отсутствующие дебаты и некорректный запрос — не события оператора, а поток
+// 404 иначе стал бы способом писать в лог. Всё остальное означает, что дебаты
+// не экспортируются ни одним запросом, а не «сейчас», — это сигнал отката
+// (docs/adr/0006-debate-export-endpoint.md).
+func (s *Server) failExport(w http.ResponseWriter, event, debateID string, err error) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, core.ErrValidation) {
+		writeError(w, err)
+		return
+	}
+	s.log.Error(event, "debate", debateID, "err", err)
+	writeError(w, errors.New("экспорт дебатов недоступен"))
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request, agent core.Agent) {

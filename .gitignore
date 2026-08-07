@@ -9,3 +9,8 @@ debate.md
 # IDE
 .idea/
 .vscode/
+
+# Локальная база (COURT_DB по умолчанию)
+/court.db
+/court.db-shm
+/court.db-wal

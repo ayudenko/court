@@ -76,7 +76,7 @@ func Generate() ([]Artifact, error) {
 		if err != nil {
 			return nil, fmt.Errorf("record %s: %w", scenario.name, err)
 		}
-		data, err := MarshalJSONL(records)
+		data, err := protocol.MarshalJSONL(records)
 		if err != nil {
 			return nil, fmt.Errorf("encode %s: %w", scenario.name, err)
 		}
@@ -126,19 +126,6 @@ func ReplayJSONL(data []byte) ([]protocol.ExportRecord, error) {
 		}
 	}
 	return protocol.CanonicalStream(debate, participants, transcript, votes)
-}
-
-// MarshalJSONL serializes validated records as one JSON object per line.
-func MarshalJSONL(records []protocol.ExportRecord) ([]byte, error) {
-	var output bytes.Buffer
-	encoder := json.NewEncoder(&output)
-	encoder.SetEscapeHTML(false)
-	for index, record := range records {
-		if err := encoder.Encode(record); err != nil {
-			return nil, fmt.Errorf("record %d: %w", index+1, err)
-		}
-	}
-	return output.Bytes(), nil
 }
 
 func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
@@ -195,74 +182,17 @@ func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 		return nil, err
 	}
 
-	view, err := service.GetDebate(created.ID)
+	// Трасса собирается тем же снимком и тем же продюсером, что и ответ
+	// GET /api/debates/{id}/export. Иначе эталон подтверждал бы формат
+	// генератора фикстур, а не формат сервера.
+	snapshot, err := service.ExportSnapshot(context.Background(), created.ID)
 	if err != nil {
 		return nil, fmt.Errorf("read concluded debate: %w", err)
 	}
-	if view.Status != core.StatusConcluded {
-		return nil, fmt.Errorf("status = %q, want %q", view.Status, core.StatusConcluded)
+	if snapshot.Debate.Status != core.StatusConcluded {
+		return nil, fmt.Errorf("status = %q, want %q", snapshot.Debate.Status, core.StatusConcluded)
 	}
-	messages, err := service.Messages(created.ID, 0)
-	if err != nil {
-		return nil, fmt.Errorf("read transcript: %w", err)
-	}
-	return recordsFor(view, []core.Agent{creator, challenger}, messages)
-}
-
-func recordsFor(
-	view core.DebateView,
-	agents []core.Agent,
-	messages []core.Message,
-) ([]protocol.ExportRecord, error) {
-	debate := protocol.ExportRecord{
-		RecordType: protocol.RecordDebate,
-		DebateID:   view.ID,
-		Debate: &protocol.DebateRecord{
-			Question: view.Question, Description: view.Description, Mode: view.Mode, Status: view.Status,
-			Rounds: view.Rounds, CurrentRound: view.CurrentRound, TurnTimeoutSec: view.TurnTimeout,
-			PrepTimeSec: view.PrepTime, CreatorID: view.CreatorID, Consensus: view.Consensus,
-			CreatedAt: view.CreatedAt,
-		},
-	}
-	agentsByID := make(map[string]core.Agent, len(agents))
-	for _, agent := range agents {
-		agentsByID[agent.ID] = agent
-	}
-	participants := make([]protocol.ExportRecord, 0, len(view.Participants))
-	for _, participant := range view.Participants {
-		agent, ok := agentsByID[participant.AgentID]
-		if !ok {
-			return nil, fmt.Errorf("participant %q has no agent metadata", participant.AgentID)
-		}
-		participants = append(participants, protocol.ExportRecord{
-			RecordType: protocol.RecordParticipant,
-			DebateID:   view.ID,
-			Participant: &protocol.ParticipantRecord{
-				AgentID: participant.AgentID, Name: participant.Name, Persona: agent.Persona,
-				Stance: participant.Stance, JoinedAt: participant.JoinedAt,
-			},
-		})
-	}
-	transcript := make([]protocol.ExportRecord, 0, len(messages))
-	for _, message := range messages {
-		record, err := protocol.RecordForMessage(message)
-		if err != nil {
-			return nil, fmt.Errorf("message %d: %w", message.Seq, err)
-		}
-		transcript = append(transcript, record)
-	}
-	votes := make([]protocol.ExportRecord, 0, len(view.Votes))
-	for _, vote := range view.Votes {
-		votes = append(votes, protocol.ExportRecord{
-			RecordType: protocol.RecordVote,
-			DebateID:   view.ID,
-			Vote: &protocol.VoteRecord{
-				AgentID: vote.AgentID, AgentName: vote.AgentName,
-				SupportsID: vote.SupportsID, SupportsName: vote.SupportsName,
-			},
-		})
-	}
-	return protocol.CanonicalStream(debate, participants, transcript, votes)
+	return protocol.Stream(snapshot)
 }
 
 func waitForConclusion(events <-chan core.Event) error {

@@ -64,6 +64,11 @@ const (
 	ScopeCredentialByIP    = "выпуск ключей с этого адреса"
 	ScopeStreamByAgent     = "одновременные подключения этого агента"
 	ScopeStreamByIP        = "одновременные подключения с этого адреса"
+	// ScopeExportCeiling — потолок одновременных сборок экспорта. Сам потолок
+	// живёт в обвязке HTTP: он ограничивает память процесса, а не клиента, и
+	// ключа у него нет. Но сигнал обязан быть тем же и с той же выборкой, иначе
+	// поток отказов утопит остальные.
+	ScopeExportCeiling = "одновременные сборки экспорта"
 )
 
 // Config holds the operator-visible limits. Its zero value disables everything.
@@ -297,6 +302,30 @@ func (l *Limiter) AcquireStream(agentID, clientIP string) (release func(), err e
 	}
 	var once sync.Once
 	return func() { once.Do(releaseHeld) }, nil
+}
+
+// LogRefusal records a refusal that some other component issued but that
+// belongs to the same abuse signal. The transport owns limits whose key is
+// neither an agent nor an address — a ceiling on the process — yet an operator
+// reads one signal, so those refusals go through the same message and the same
+// per-scope sampling. Without it a saturated ceiling is an outage with no
+// server-side evidence at all.
+func (l *Limiter) LogRefusal(scope, clientIP string) {
+	if l == nil || l.log == nil {
+		return
+	}
+	suppressed, ok := l.logSampler.admit(scope, l.now())
+	if !ok {
+		return
+	}
+	attrs := []any{"scope", scope}
+	if clientIP != "" {
+		attrs = append(attrs, "ip", clientIP)
+	}
+	if suppressed > 0 {
+		attrs = append(attrs, "suppressed_since_last", suppressed)
+	}
+	l.log.Warn("лимит: запрос отклонён", attrs...)
 }
 
 // logRejection records a rejection, sampled per scope. Rejections happen

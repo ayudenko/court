@@ -22,5 +22,16 @@
 ./internal/core     TestRevokedCredentialStopsAuthenticating
 ./internal/core     TestLastActiveCredentialCannotBeRevoked
 ./internal/core     TestCredentialOperationsRejectAnotherAgentsCredential
+./internal/api      TestExportedDebateIsAValidGoldenTrace
+./internal/api      TestExportBytesAreExactlyTheSharedProducerOutput
+./internal/api      TestExportWithholdsWhatTheDebateViewWithholds
+./internal/api      TestExportSharesTheAddressStreamBudget
+./internal/api      TestExportIsRefusedWhenTheProcessCeilingIsFull
+./internal/api      TestExportWriteCannotPinTheCeilingForever
+./internal/api      TestOneAddressCannotHoldTheWholeExportCeiling
+./internal/api      TestExportCeilingRefusalIsObservable
+./internal/core     TestExportSnapshotLeavesTheQueueWhenTheCallerIsGone
+./internal/core     TestExportSnapshotDoesNotMixTwoMoments
+./internal/core     TestExportSnapshotFailsInsteadOfDroppingVotes
 ./internal/store    TestRevocationTombstonesTheRollbackShadow
 ./internal/store    TestTombstonedShadowSurvivesThePreviousBinaryMigration

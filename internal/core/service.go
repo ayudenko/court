@@ -202,6 +202,25 @@ func (s *Service) nowUTC() time.Time { return s.now().UTC() }
 func (s *Service) lock()   { s.mu <- struct{}{} }
 func (s *Service) unlock() { <-s.mu }
 
+// lockContext ждёт замок переходов, пока жив контекст вызова. Нужен на путях,
+// которые вызываются с публичной границы: отменённый запрос обязан выйти из
+// очереди, а не удерживать её и не делать работу, результат которой уже некому
+// прочитать.
+func (s *Service) lockContext(ctx context.Context) error {
+	// Проверка до select: при свободном замке и уже отменённом контексте select
+	// выбрал бы ветку случайно, и отменённый запрос иногда всё равно делал бы
+	// работу.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case s.mu <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Run запускает фоновые процессы: тикер дедлайнов и восстановление
 // зависших модераций после рестарта. Блокируется до отмены ctx.
 func (s *Service) Run(ctx context.Context) {
@@ -1278,6 +1297,63 @@ func (s *Service) Messages(debateID string, afterSeq int64) ([]Message, error) {
 	return s.store.Messages(debateID, afterSeq)
 }
 
+// ExportSnapshot — согласованный срез дебатов: состояние в том же виде, в каком
+// его отдаёт публичное чтение, метаданные агентов-участников и полный протокол.
+// Тип принадлежит ядру и ничего не знает о форматах: сериализацию делает
+// internal/protocol.
+type ExportSnapshot struct {
+	Debate       DebateView
+	Participants []Agent
+	Messages     []Message
+}
+
+// ExportSnapshot читает дебаты целиком под замком переходов состояния.
+//
+// Замок здесь не про свежесть, а про согласованность: без него срез склеивает
+// состояние до хода с протоколом после него и публикует артефакт, которого не
+// существовало ни в один момент — и ничем об этом не сообщает. Замок никогда не
+// удерживается на время вызова модератора, поэтому ожидание ограничено одной
+// секцией записи в хранилище (docs/adr/0006-debate-export-endpoint.md).
+//
+// Ожидание замка отменяемо, и это обязательно: чтение вызывается с публичной
+// неаутентифицированной границы, и запрос, чей клиент уже отключился, обязан
+// покинуть очередь, а не занимать её и не делать работу в пустоту. Протокол
+// читается ровно один раз и он же считает голоса: второе чтение внутри view
+// молча роняет голоса при сбое, а экспорт без голосов неотличим от дебатов,
+// где никто не голосовал.
+func (s *Service) ExportSnapshot(ctx context.Context, debateID string) (ExportSnapshot, error) {
+	if err := s.lockContext(ctx); err != nil {
+		return ExportSnapshot{}, err
+	}
+	defer s.unlock()
+	d, err := s.store.GetDebate(debateID)
+	if err != nil {
+		return ExportSnapshot{}, err
+	}
+	messages, err := s.store.Messages(debateID, 0)
+	if err != nil {
+		return ExportSnapshot{}, err
+	}
+	// Именно представление, а не строка хранилища: оно скрывает description до
+	// старта дебатов, и экспорт обязан скрывать ровно то же самое.
+	view, err := s.viewFrom(d, messages)
+	if err != nil {
+		return ExportSnapshot{}, err
+	}
+	agents := make([]Agent, 0, len(view.Participants))
+	for _, p := range view.Participants {
+		agent, err := s.store.AgentByID(p.AgentID)
+		if err != nil {
+			// Ошибка намеренно не оборачивается: участник без агента — это
+			// расхождение внутри хранилища, а обёртка превратила бы его в
+			// «дебаты не найдены» на границе HTTP.
+			return ExportSnapshot{}, fmt.Errorf("метаданные участника %s недоступны: %v", p.AgentID, err)
+		}
+		agents = append(agents, agent)
+	}
+	return ExportSnapshot{Debate: view, Participants: agents, Messages: messages}, nil
+}
+
 // Subscribe/Unsubscribe — доступ к хабу событий.
 func (s *Service) Subscribe(debateID string) chan Event       { return s.hub.Subscribe(debateID) }
 func (s *Service) Unsubscribe(debateID string, ch chan Event) { s.hub.Unsubscribe(debateID, ch) }
@@ -1379,7 +1455,20 @@ func renderTranscriptText(msgs []Message) string {
 	return sb.String()
 }
 
+// view собирает публичное представление, читая протокол сам. Ошибка чтения
+// здесь намеренно не рвёт ответ: голоса — производная величина, а состояние и
+// участники уже прочитаны. Экспорт этим путём не идёт: там пропавшие голоса
+// неотличимы от дебатов, где никто не голосовал, поэтому он передаёт
+// авторитетный протокол в viewFrom.
 func (s *Service) view(d Debate) (DebateView, error) {
+	var transcript []Message
+	if d.Mode == ModeHybrid && d.Status != StatusOpen {
+		transcript, _ = s.store.Messages(d.ID, 0)
+	}
+	return s.viewFrom(d, transcript)
+}
+
+func (s *Service) viewFrom(d Debate, transcript []Message) (DebateView, error) {
 	parts, err := s.store.Participants(d.ID)
 	if err != nil {
 		return DebateView{}, err
@@ -1411,9 +1500,7 @@ func (s *Service) view(d Debate) (DebateView, error) {
 		v.TurnDeadline = &t
 	}
 	if d.Mode == ModeHybrid && d.Status != StatusOpen {
-		if msgs, err := s.store.Messages(d.ID, 0); err == nil {
-			v.Votes = currentVotes(parts, msgs)
-		}
+		v.Votes = currentVotes(parts, transcript)
 	}
 	return v, nil
 }
