@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,16 +15,42 @@ import (
 
 	"court/internal/api"
 	"court/internal/core"
+	"court/internal/ratelimit"
 )
 
+// DefaultMaxRequestDuration ограничивает время жизни одного запроса к /mcp.
+//
+// SDK держит поток до отмены контекста и сам keepalive не шлёт, а такие
+// сессии stateless — значит оборванное соединение (сон ноутбука, смена сети,
+// убитый клиент) не отменяет контекст, пока ОС не признает сокет мёртвым, и
+// слот остаётся занятым. Потолок делает утечку ограниченной по времени, а не
+// вечной. Самый долгий законный запрос — wait_for_turn на MaxWaitSec.
+const DefaultMaxRequestDuration = (api.MaxWaitSec + 30) * time.Second
+
+// Option настраивает MCP-обвязку.
+type Option func(*config)
+
+type config struct{ maxRequestDuration time.Duration }
+
+// WithMaxRequestDuration задаёт потолок времени одного запроса к /mcp.
+func WithMaxRequestDuration(d time.Duration) Option {
+	return func(c *config) { c.maxRequestDuration = d }
+}
+
 // Handler возвращает http.Handler MCP-сервера для монтирования на /mcp.
-func Handler(svc *core.Service, version string) http.Handler {
+// limiter — тот же экземпляр, что у REST: иначе смена транспорта давала бы
+// второй бюджет на те же операции.
+func Handler(svc *core.Service, version string, limiter *ratelimit.Limiter, options ...Option) http.Handler {
+	cfg := config{maxRequestDuration: DefaultMaxRequestDuration}
+	for _, option := range options {
+		option(&cfg)
+	}
 	server := sdk.NewServer(&sdk.Implementation{
 		Name:    "court",
 		Title:   "Court — дебаты AI-агентов",
 		Version: version,
 	}, nil)
-	registerTools(server, svc)
+	registerTools(server, svc, limiter)
 
 	mcpHandler := sdk.NewStreamableHTTPHandler(
 		func(*http.Request) *sdk.Server { return server },
@@ -32,10 +59,28 @@ func Handler(svc *core.Service, version string) http.Handler {
 	// Аутентификация необязательна: register_agent и чтение доступны без ключа,
 	// инструменты-действия сами требуют агента в контексте.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientIP := limiter.ClientIP(r)
+		ctx := api.WithClientIP(r.Context(), clientIP)
+		agentID := ""
 		if agent, err := api.AgentFromRequest(svc, r); err == nil {
-			r = r.WithContext(api.WithAgent(r.Context(), agent))
+			ctx = api.WithAgent(ctx, agent)
+			agentID = agent.ID
 		}
-		mcpHandler.ServeHTTP(w, r)
+		// Слот занимает транспорт, а не отдельные инструменты: у /mcp есть
+		// долгоживущие методы помимо wait_for_turn (subscriptions/listen —
+		// поток, который держится до разрыва и не требует ключа). Лимит на
+		// уровне инструментов такие потоки не видит.
+		release, err := limiter.AcquireStream(agentID, clientIP)
+		defer release()
+		if err != nil {
+			api.WriteError(w, err)
+			return
+		}
+		// Потолок времени запроса: иначе оборванное соединение держит слот,
+		// пока ОС не закроет сокет, и агент запирает сам себя до рестарта.
+		ctx, cancel := context.WithTimeout(ctx, cfg.maxRequestDuration)
+		defer cancel()
+		mcpHandler.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -45,6 +90,15 @@ func requireAgent(ctx context.Context) (core.Agent, error) {
 		return core.Agent{}, fmt.Errorf("нужен API-ключ: передайте заголовок Authorization: Bearer <ключ>; ключ выдаёт инструмент register_agent")
 	}
 	return agent, nil
+}
+
+// refundInvalid возвращает потраченный лимит, когда вызов отклонён валидацией:
+// он ничего не создал, а агент, который шлёт кривые аргументы, иначе запирает
+// сам себя. Отказы по другим причинам оплачены — там работа уже сделана.
+func refundInvalid(grant *ratelimit.Grant, err error) {
+	if errors.Is(err, core.ErrValidation) {
+		grant.Refund()
+	}
 }
 
 func jsonResult(v any) (*sdk.CallToolResult, any, error) {
@@ -100,14 +154,19 @@ type postIn struct {
 	SupportAgentID string `json:"support_agent_id,omitempty" jsonschema:"голос: agent_id участника, чью позицию вы сейчас поддерживаете (не указан — свою). В режиме hybrid единогласие голосов завершает дебаты консенсусом"`
 }
 
-func registerTools(server *sdk.Server, svc *core.Service) {
+func registerTools(server *sdk.Server, svc *core.Service, limiter *ratelimit.Limiter) {
 	sdk.AddTool(server, &sdk.Tool{
 		Name: "register_agent",
 		Description: "Зарегистрировать нового агента и получить API-ключ. " +
 			"Ключ показывается один раз — сохраните его и передавайте в заголовке Authorization: Bearer <ключ>.",
-	}, func(_ context.Context, _ *sdk.CallToolRequest, in registerIn) (*sdk.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, in registerIn) (*sdk.CallToolResult, any, error) {
+		grant, err := limiter.AllowRegistration(api.ClientIPFrom(ctx))
+		if err != nil {
+			return nil, nil, err
+		}
 		agent, key, err := svc.RegisterAgent(in.Name, in.Persona)
 		if err != nil {
+			refundInvalid(&grant, err)
 			return nil, nil, err
 		}
 		return jsonResult(map[string]any{"agent": agent, "api_key": key})
@@ -134,6 +193,10 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 		if err != nil {
 			return nil, nil, err
 		}
+		grant, err := limiter.AllowDebateCreation(agent.ID, api.ClientIPFrom(ctx))
+		if err != nil {
+			return nil, nil, err
+		}
 		v, err := svc.CreateDebate(agent, core.CreateDebateParams{
 			Question:       in.Question,
 			Description:    in.Description,
@@ -145,6 +208,7 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 			Observer:       in.Observer,
 		})
 		if err != nil {
+			refundInvalid(&grant, err)
 			return nil, nil, err
 		}
 		return jsonResult(v)
@@ -219,6 +283,7 @@ func registerTools(server *sdk.Server, svc *core.Service) {
 		if err != nil {
 			return nil, nil, err
 		}
+		// Слот этого long-poll уже занят обёрткой транспорта в Handler.
 		waitSec := in.WaitSec
 		if waitSec <= 0 {
 			waitSec = 60

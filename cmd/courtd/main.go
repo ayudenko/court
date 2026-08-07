@@ -10,6 +10,22 @@
 //	COURT_MODERATOR_API_KEY   ключ провайдера модератора; если пуст —
 //	                          ANTHROPIC_API_KEY / OPENAI_API_KEY
 //	COURT_MODERATOR_NAME      отображаемое имя (по умолчанию «Модератор»)
+//
+// Лимиты (0 отключает лимит), см. docs/adr/0003-http-rate-limiting.md:
+//
+//	COURT_CLIENT_IP_HEADER          заголовок с адресом клиента от доверенного
+//	                                прокси (на Fly.io — Fly-Client-IP). Пусто —
+//	                                RemoteAddr. Задавать только когда прокси
+//	                                действительно перезаписывает этот заголовок:
+//	                                иначе клиент сам выбирает себе счётчик.
+//	COURT_RATE_REGISTRATIONS_PER_HOUR  регистраций агентов с одного адреса в час
+//	                                   (по умолчанию 10)
+//	COURT_RATE_DEBATES_PER_HOUR        создание дебатов на один agent_id в час
+//	                                   (по умолчанию 10)
+//	COURT_RATE_DEBATES_PER_HOUR_PER_IP создание дебатов с одного адреса в час,
+//	                                   поверх лимита на agent_id (по умолчанию 20)
+//	COURT_MAX_STREAMS_PER_CLIENT       одновременных long-poll, SSE и запросов
+//	                                   к /mcp на клиента (по умолчанию 20)
 package main
 
 import (
@@ -20,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +46,7 @@ import (
 	"court/internal/llm"
 	"court/internal/mcp"
 	"court/internal/moderator"
+	"court/internal/ratelimit"
 	"court/internal/store"
 	"court/internal/web"
 	"court/skills"
@@ -65,10 +83,41 @@ func main() {
 	defer stop()
 	go svc.Run(ctx)
 
+	limiter, err := buildRateLimiter(log)
+	if err != nil {
+		log.Error("настройка лимитов", "err", err)
+		os.Exit(1)
+	}
+
+	mux := buildHandler(svc, limiter, log)
+
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("courtd запущен", "addr", addr, "db", dbPath, "version", version)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error("HTTP-сервер", "err", err)
+		os.Exit(1)
+	}
+	log.Info("courtd остановлен")
+}
+
+// buildHandler собирает полный HTTP-граф сервиса. Отдельная функция, чтобы тест
+// проверял именно ту обвязку, которую запускает main: лимитер здесь
+// необязательный аргумент, и незаметно потерянный, он ничего не сломает.
+func buildHandler(svc *core.Service, limiter *ratelimit.Limiter, log *slog.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
-	apiServer := api.New(svc, log)
-	apiServer.Routes(mux)
-	mux.Handle("/mcp", mcp.Handler(svc, version))
+	api.New(svc, log, limiter).Routes(mux)
+	mux.Handle("/mcp", mcp.Handler(svc, version, limiter))
 	mux.Handle("GET /{$}", web.Handler())
 	mux.Handle("GET /new", web.Handler())
 	mux.Handle("GET /d/{id}", web.Handler())
@@ -118,25 +167,7 @@ func main() {
 			log.Warn("запись приглашения", "debate_id", d.ID, "err", err)
 		}
 	})
-
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
-	}()
-
-	log.Info("courtd запущен", "addr", addr, "db", dbPath, "version", version)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Error("HTTP-сервер", "err", err)
-		os.Exit(1)
-	}
-	log.Info("courtd остановлен")
+	return mux
 }
 
 func buildModerator(log *slog.Logger) (core.Moderator, error) {
@@ -167,9 +198,51 @@ func buildModerator(log *slog.Logger) (core.Moderator, error) {
 	return moderator.New(name, provider), nil
 }
 
+func buildRateLimiter(log *slog.Logger) (*ratelimit.Limiter, error) {
+	cfg := ratelimit.Config{ClientIPHeader: os.Getenv("COURT_CLIENT_IP_HEADER")}
+	var err error
+	if cfg.RegistrationsPerHourPerIP, err = envInt("COURT_RATE_REGISTRATIONS_PER_HOUR", 10); err != nil {
+		return nil, err
+	}
+	if cfg.DebatesPerHourPerAgent, err = envInt("COURT_RATE_DEBATES_PER_HOUR", 10); err != nil {
+		return nil, err
+	}
+	if cfg.DebatesPerHourPerIP, err = envInt("COURT_RATE_DEBATES_PER_HOUR_PER_IP", 20); err != nil {
+		return nil, err
+	}
+	if cfg.StreamsPerClient, err = envInt("COURT_MAX_STREAMS_PER_CLIENT", 20); err != nil {
+		return nil, err
+	}
+	if cfg.ClientIPHeader == "" {
+		log.Warn("COURT_CLIENT_IP_HEADER не задан — лимиты по адресу считают RemoteAddr; " +
+			"за обратным прокси все клиенты попадут в один счётчик")
+	}
+	log.Info("лимиты настроены",
+		"registrations_per_hour", cfg.RegistrationsPerHourPerIP,
+		"debates_per_hour", cfg.DebatesPerHourPerAgent,
+		"debates_per_hour_per_ip", cfg.DebatesPerHourPerIP,
+		"streams_per_client", cfg.StreamsPerClient,
+		"client_ip_header", cfg.ClientIPHeader)
+	return ratelimit.New(cfg, ratelimit.WithLogger(log)), nil
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+// envInt читает числовую настройку. Некорректное значение — ошибка запуска, а не
+// тихий откат к умолчанию: молча проигнорированный лимит выглядит как рабочий.
+func envInt(key string, def int) (int, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s: ожидается целое ≥ 0, получено %q", key, raw)
+	}
+	return value, nil
 }

@@ -3,3 +3,7 @@
 ./internal/core     TestAuthenticateRejectsUnknownKey
 ./internal/moderator TestCheckRoundUsesStructuredResult
 ./internal/moderator TestCheckRoundRejectsInvalidStructuredResult
+./internal/api      TestRegisterRateLimitRejectsBurstFromOneClient
+./internal/api      TestCreateDebateRateLimitIsPerAgentKey
+./internal/api      TestStreamLimitReleasesSlotOnDisconnect
+./cmd/courtd        TestShippedDefaultsAreEnforcedByTheProductionHandler

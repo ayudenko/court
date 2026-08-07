@@ -29,11 +29,11 @@ Do not document raw Go command sequences elsewhere; link to these make targets.
 | Risk | Required check or tracked work | Status |
 |---|---|---|
 | Turn/round state machine | `TestDebateStateMachineReachesConsensus` | enforced by `make check` |
-| Unknown credentials | `TestAuthenticateRejectsUnknownKey` | enforced by `make check` |
+| HTTP trust boundary: auth and abuse limits | `TestAuthenticateRejectsUnknownKey`, `TestRegisterRateLimitRejectsBurstFromOneClient`, `TestCreateDebateRateLimitIsPerAgentKey`, `TestStreamLimitReleasesSlotOnDisconnect`, `TestShippedDefaultsAreEnforcedByTheProductionHandler` | enforced by `make check` |
 | Structured moderation | `TestCheckRoundUsesStructuredResult`, `TestCheckRoundRejectsInvalidStructuredResult` | enforced by `make check` |
 | Store concurrency/restart | issues #18 and #6 | tracked; named tests required when implemented |
 | REST/MCP core-state parity | issue #8 | tracked; named conformance test required |
-| Auth, credentials, spend boundary | issues #2, #3, #5, #20 | tracked; security review and named tests required |
+| Credential rotation and spend boundary | issues #3, #5, #20 | tracked; security review and named tests required |
 
 A row without a named test must point to an issue and is debt, not an enforced
 guarantee. `quality/enforced-tests.txt` maps every enforced name above to its Go

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"court/internal/core"
+	"court/internal/ratelimit"
 	"court/internal/store"
 )
 
@@ -23,15 +24,16 @@ const MaxWaitSec = 120
 type Server struct {
 	svc               *core.Service
 	log               *slog.Logger
+	limiter           *ratelimit.Limiter
 	heartbeatInterval time.Duration
 }
 
-// New создаёт сервер API.
-func New(svc *core.Service, log *slog.Logger) *Server {
+// New создаёт сервер API. Нулевой limiter означает «без лимитов».
+func New(svc *core.Service, log *slog.Logger, limiter *ratelimit.Limiter) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{svc: svc, log: log, heartbeatInterval: 25 * time.Second}
+	return &Server{svc: svc, log: log, limiter: limiter, heartbeatInterval: 25 * time.Second}
 }
 
 // Routes регистрирует маршруты API на mux.
@@ -51,9 +53,53 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/debates/{id}/messages", s.handleMessages)
 	mux.HandleFunc("POST /api/debates/{id}/join", s.auth(s.handleJoin))
 	mux.HandleFunc("POST /api/debates/{id}/start", s.auth(s.handleStart))
-	mux.HandleFunc("GET /api/debates/{id}/turn", s.auth(s.handleTurn))
+	mux.HandleFunc("GET /api/debates/{id}/turn", s.auth(s.limitAgentStream(s.handleTurn)))
 	mux.HandleFunc("POST /api/debates/{id}/messages", s.auth(s.handlePost))
-	mux.HandleFunc("GET /api/debates/{id}/events", s.handleEvents)
+	mux.HandleFunc("GET /api/debates/{id}/events", s.limitIPStream(s.handleEvents))
+}
+
+// --- Лимиты ---
+//
+// Лимиты живут на границе HTTP, а не в ядре: ключ лимита — адрес клиента или
+// стабильный agent_id, и ни то ни другое ядру не известно.
+// См. docs/adr/0003-http-rate-limiting.md.
+
+// refundInvalid возвращает потраченный лимит, если ядро отклонило запрос по
+// валидации: ничего не создано, модератор не тронут, а агент, который шлёт
+// кривые аргументы, иначе запирает сам себя на час. Нераспознанное тело
+// (`decode`) остаётся оплаченным: иначе поток мусора на неаутентифицированную
+// регистрацию бесплатен, а лимит на ней — единственная защита.
+func refundInvalid(grant *ratelimit.Grant, err error) {
+	if errors.Is(err, core.ErrValidation) {
+		grant.Refund()
+	}
+}
+
+// limitAgentStream ограничивает одновременные long-poll агента.
+func (s *Server) limitAgentStream(next authedHandler) authedHandler {
+	return func(w http.ResponseWriter, r *http.Request, agent core.Agent) {
+		release, err := s.limiter.AcquireStream(agent.ID, s.limiter.ClientIP(r))
+		defer release()
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		next(w, r, agent)
+	}
+}
+
+// limitIPStream ограничивает одновременные SSE-подписки: поток событий открыт
+// всем, поэтому ключом может быть только адрес.
+func (s *Server) limitIPStream(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		release, err := s.limiter.AcquireStream("", s.limiter.ClientIP(r))
+		defer release()
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // --- Аутентификация ---
@@ -85,6 +131,13 @@ func (s *Server) auth(next authedHandler) http.HandlerFunc {
 // --- Хендлеры ---
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	// Лимит берётся до разбора тела: иначе поток нечитаемых запросов на
+	// единственную неаутентифицированную запись ничего не стоит.
+	grant, err := s.limiter.AllowRegistration(s.limiter.ClientIP(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	var req struct {
 		Name    string `json:"name"`
 		Persona string `json:"persona"`
@@ -94,6 +147,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	agent, key, err := s.svc.RegisterAgent(req.Name, req.Persona)
 	if err != nil {
+		refundInvalid(&grant, err)
 		writeError(w, err)
 		return
 	}
@@ -119,6 +173,11 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 		PrepTimeSec    int    `json:"prep_time_sec"`
 		Observer       bool   `json:"observer"`
 	}
+	grant, err := s.limiter.AllowDebateCreation(agent.ID, s.limiter.ClientIP(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	if !decode(w, r, &req) {
 		return
 	}
@@ -133,6 +192,7 @@ func (s *Server) handleCreateDebate(w http.ResponseWriter, r *http.Request, agen
 		Observer:       req.Observer,
 	})
 	if err != nil {
+		refundInvalid(&grant, err)
 		writeError(w, err)
 		return
 	}
@@ -350,6 +410,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// WriteError отдаёт ошибку в общем для сервиса формате. Экспортирован для
+// MCP-обвязки, которая отклоняет запрос до JSON-RPC-слоя.
+func WriteError(w http.ResponseWriter, err error) { writeError(w, err) }
+
 func writeError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	switch {
@@ -363,6 +427,13 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case errors.Is(err, core.ErrNotYourTurn), errors.Is(err, core.ErrBadState):
 		status = http.StatusConflict
+	case errors.Is(err, ratelimit.ErrLimited):
+		status = http.StatusTooManyRequests
+		// Заголовок ставится до WriteHeader внутри writeJSON.
+		var limitErr *ratelimit.LimitError
+		if errors.As(err, &limitErr) && limitErr.RetryAfterSeconds() > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(limitErr.RetryAfterSeconds()))
+		}
 	}
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
@@ -370,6 +441,8 @@ func writeError(w http.ResponseWriter, err error) {
 // Контекстные хелперы (используются MCP-обвязкой).
 
 type ctxKey struct{}
+
+type clientIPKey struct{}
 
 // WithAgent кладёт аутентифицированного агента в контекст.
 func WithAgent(ctx context.Context, a core.Agent) context.Context {
@@ -380,4 +453,16 @@ func WithAgent(ctx context.Context, a core.Agent) context.Context {
 func AgentFrom(ctx context.Context) (core.Agent, bool) {
 	a, ok := ctx.Value(ctxKey{}).(core.Agent)
 	return a, ok
+}
+
+// WithClientIP кладёт в контекст адрес клиента, разрешённый лимитером.
+// У MCP-инструментов нет http.Request, а ключ лимита им нужен.
+func WithClientIP(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey{}, ip)
+}
+
+// ClientIPFrom достаёт адрес клиента из контекста.
+func ClientIPFrom(ctx context.Context) string {
+	ip, _ := ctx.Value(clientIPKey{}).(string)
+	return ip
 }
