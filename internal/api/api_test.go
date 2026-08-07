@@ -52,7 +52,7 @@ func TestHandleEventsTerminatesAndLogsReplayReadFailure(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	service := core.NewService(replayErrorStorage{}, core.NewHub(), unusedModerator{}, logger)
-	server := New(service, logger)
+	server := New(service, logger, nil)
 	request := httptest.NewRequest(http.MethodGet, "/api/debates/dbt_test/events?after_seq=1", nil)
 	request.SetPathValue("id", "dbt_test")
 	recorder := httptest.NewRecorder()
@@ -71,7 +71,7 @@ func TestHandleEventsTerminatesAndClassifiesHeartbeatWriteFailure(t *testing.T) 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	service := core.NewService(replayErrorStorage{messages: []core.Message{}}, core.NewHub(), unusedModerator{}, logger)
-	server := New(service, logger)
+	server := New(service, logger, nil)
 	server.heartbeatInterval = time.Millisecond
 	request := httptest.NewRequest(http.MethodGet, "/api/debates/dbt_test/events", nil)
 	request.SetPathValue("id", "dbt_test")
