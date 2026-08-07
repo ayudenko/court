@@ -308,7 +308,7 @@ func (s *Store) ActiveDebates() ([]core.Debate, error) {
 		core.StatusPreparing, core.StatusRunning, core.StatusModerating)
 }
 
-func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
+func (s *Store) queryDebates(tail string, args ...any) (_ []core.Debate, err error) {
 	rows, err := s.db.Query(
 		`SELECT id, question, description, mode, status, rounds, current_round, turn_timeout,
 		        prep_time, creator_id, turn_agent_id, turn_deadline, consensus, created_at
@@ -316,7 +316,9 @@ func (s *Store) queryDebates(tail string, args ...any) ([]core.Debate, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 	var out []core.Debate
 	for rows.Next() {
 		var d core.Debate
@@ -345,7 +347,7 @@ func (s *Store) AddParticipant(debateID, agentID, stance string, at time.Time) e
 }
 
 // Participants возвращает участников в порядке присоединения — это порядок ходов.
-func (s *Store) Participants(debateID string) ([]core.Participant, error) {
+func (s *Store) Participants(debateID string) (_ []core.Participant, err error) {
 	rows, err := s.db.Query(
 		`SELECT p.agent_id, a.name, p.stance, p.joined_at
 		 FROM participants p JOIN agents a ON a.id = p.agent_id
@@ -353,7 +355,9 @@ func (s *Store) Participants(debateID string) ([]core.Participant, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 	var out []core.Participant
 	for rows.Next() {
 		var p core.Participant
@@ -387,7 +391,7 @@ func (s *Store) AddMessage(m core.Message) (int64, error) {
 }
 
 // Messages возвращает протокол дискуссии после указанного seq.
-func (s *Store) Messages(debateID string, afterSeq int64) ([]core.Message, error) {
+func (s *Store) Messages(debateID string, afterSeq int64) (_ []core.Message, err error) {
 	rows, err := s.db.Query(
 		`SELECT seq, debate_id, round, speaker_id, speaker_name, kind, text,
 		        support_id, support_name, moderation_json, created_at
@@ -395,7 +399,9 @@ func (s *Store) Messages(debateID string, afterSeq int64) ([]core.Message, error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 	var out []core.Message
 	for rows.Next() {
 		var m core.Message
@@ -580,12 +586,14 @@ func (verdict storedVerdictV1) toCore() core.ModerationVerdict {
 	}
 }
 
-func columnExists(db *sql.DB, table, column string) (bool, error) {
+func columnExists(db *sql.DB, table, column string) (_ bool, err error) {
 	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string

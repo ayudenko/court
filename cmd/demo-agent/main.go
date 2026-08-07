@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -326,7 +327,7 @@ func printTranscript(ctx context.Context, c *client, debateID string) {
 
 // --- HTTP-клиент ---
 
-func (c *client) do(ctx context.Context, method, path string, body, out any) error {
+func (c *client) do(ctx context.Context, method, path string, body, out any) (err error) {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -349,7 +350,9 @@ func (c *client) do(ctx context.Context, method, path string, body, out any) err
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		err = errors.Join(err, resp.Body.Close())
+	}()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return err

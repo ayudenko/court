@@ -141,12 +141,14 @@ func MarshalJSONL(records []protocol.ExportRecord) ([]byte, error) {
 	return output.Bytes(), nil
 }
 
-func recordScenario(spec scenario) ([]protocol.ExportRecord, error) {
+func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 	database, err := store.Open(":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	defer database.Close()
+	defer func() {
+		err = errors.Join(err, database.Close())
+	}()
 
 	ids := newDeterministicIDs(strings.TrimSuffix(spec.name, ".jsonl"))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

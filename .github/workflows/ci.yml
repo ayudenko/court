@@ -3,9 +3,6 @@ name: CI
 on:
   pull_request:
   push:
-    branches:
-      - master
-      - main
 
 permissions:
   contents: read
@@ -21,5 +18,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version-file: .golangci-lint-version
+          install-only: true
       - name: Run quality gate
         run: make check
