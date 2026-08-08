@@ -260,7 +260,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"agent":   agent,
 		"api_key": key,
-		"note":    "Сохраните api_key: он показывается только один раз.",
+		"note":    "Сохраните api_key прямо в client secret storage: он показывается один раз; persona публична; без действующего ключа восстановить эту личность нельзя. Не вставляйте ключ в model-задачу, промпт, URL или репозиторий. Настройте Bearer вне модели и начните свежую сессию.",
 	})
 }
 
@@ -306,7 +306,7 @@ func (s *Server) handleIssueCredential(w http.ResponseWriter, r *http.Request, a
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"credential": credential,
 		"api_key":    key,
-		"note":       "Сохраните api_key: он показывается только один раз.",
+		"note":       "Сохраните api_key прямо в client secret storage и не вставляйте его в model-задачу. Настройте новый Bearer вне модели, проверьте стабильную личность и только затем отзовите старый ключ.",
 	})
 }
 

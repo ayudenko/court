@@ -9,6 +9,9 @@
 ./cmd/demo-agent    TestComposeDemoDefaultsAreCredentialFree
 ./cmd/demo-agent    TestDockerBuildContextExcludesDotEnvSecrets
 ./internal/core     TestAuthenticateRejectsUnknownKey
+./internal/mcp      TestMCPToolSchemasKeepCredentialsOutOfArguments
+./internal/mcp      TestMCPInvalidBearerCannotRegisterReplacement
+./cmd/courtd        TestCredentialBootstrapInstructionsKeepSecretIssuanceInCleanTasks
 ./internal/moderator TestCheckRoundUsesStructuredResult
 ./internal/moderator TestCheckRoundRejectsInvalidStructuredResult
 ./internal/api      TestRegisterRateLimitRejectsBurstFromOneClient
@@ -53,6 +56,7 @@
 ./internal/conformance TestSpecStatesTheLimitsItIsCheckedAgainst
 ./internal/conformance TestCheckRecordsEnforcesTheWholeStream
 ./internal/api      TestExportedArtifactConformsToSpec
+./internal/mcp      TestMCPWhoAmIReturnsStableIdentity
 ./internal/core     TestHybridRecordsEverySkippedModerationResult
 ./internal/core     TestUnavailableModeratorNoticeIsRecordedOncePerRound
 ./internal/core     TestARecordedDegradationBindsItsRound

@@ -16,27 +16,14 @@ import (
 	"court/internal/store"
 )
 
-// TestLimitsAreSharedBetweenRestAndMcp: REST and MCP expose the same
-// operations, so a per-transport budget would be no budget at all — a caller
-// would simply alternate.
+// TestLimitsAreSharedBetweenRestAndMcp: debate creation exists on both REST and
+// MCP, so a per-transport budget would be no budget at all — a caller would
+// simply alternate.
 func TestLimitsAreSharedBetweenRestAndMcp(t *testing.T) {
 	mux, service := newSharedServer(t, ratelimit.Config{
-		RegistrationsPerHourPerIP: 1,
-		DebatesPerHourPerAgent:    1,
-		ClientIPHeader:            "Fly-Client-IP",
+		DebatesPerHourPerAgent: 1,
+		ClientIPHeader:         "Fly-Client-IP",
 	})
-
-	// Registration: spend the address budget over REST, then try MCP.
-	if status := restRegister(mux, "203.0.113.7"); status != http.StatusCreated {
-		t.Fatalf("REST registration: status = %d, want 201", status)
-	}
-	if body := callTool(mux, "", "203.0.113.7", `{"name":"mcp"}`, "register_agent"); !isLimited(body) {
-		t.Fatalf("MCP registration was not charged to the address budget spent over REST: %s", body)
-	}
-	// The limit is per address, not global.
-	if body := callTool(mux, "", "198.51.100.4", `{"name":"mcp"}`, "register_agent"); isLimited(body) {
-		t.Fatalf("unrelated address inherited an exhausted budget: %s", body)
-	}
 
 	// Debate creation: spend the agent budget over MCP, then try REST.
 	_, key, err := service.RegisterAgent("organiser", "")
@@ -73,9 +60,18 @@ func newSharedServer(t *testing.T, cfg ratelimit.Config) (*http.ServeMux, *core.
 }
 
 func callTool(mux *http.ServeMux, key, clientIP, arguments, tool string) string {
+	return callToolAt(mux, "/mcp", key, clientIP, arguments, tool)
+}
+
+func callToolAt(mux *http.ServeMux, path, key, clientIP, arguments, tool string) string {
+	_, body := callToolHTTPAt(mux, path, key, clientIP, arguments, tool)
+	return body
+}
+
+func callToolHTTPAt(mux *http.ServeMux, path, key, clientIP, arguments, tool string) (int, string) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tool +
 		`","arguments":` + arguments + `}}`
-	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	request.Header.Set("Fly-Client-IP", clientIP)
@@ -84,19 +80,11 @@ func callTool(mux *http.ServeMux, key, clientIP, arguments, tool string) string 
 	}
 	recorder := httptest.NewRecorder()
 	mux.ServeHTTP(recorder, request)
-	return recorder.Body.String()
+	return recorder.Code, recorder.Body.String()
 }
 
 func isLimited(mcpResponse string) bool {
 	return strings.Contains(mcpResponse, ratelimit.ErrLimited.Error())
-}
-
-func restRegister(mux *http.ServeMux, clientIP string) int {
-	request := httptest.NewRequest(http.MethodPost, "/api/agents", strings.NewReader(`{"name":"rest"}`))
-	request.Header.Set("Fly-Client-IP", clientIP)
-	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, request)
-	return recorder.Code
 }
 
 func restCreateDebate(mux *http.ServeMux, key string) int {
@@ -147,6 +135,9 @@ func TestAbandonedStreamReleasesItsSlotWithinTheBound(t *testing.T) {
 	if status := probeToolsList(t, server.URL); status != http.StatusTooManyRequests {
 		t.Fatalf("while the stream is open: status = %d, want 429", status)
 	}
+	if status := probeInvalidBearer(t, server.URL); status != http.StatusTooManyRequests {
+		t.Fatalf("invalid Bearer bypassed the occupied address slot: status = %d, want 429", status)
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -158,6 +149,24 @@ func TestAbandonedStreamReleasesItsSlotWithinTheBound(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func probeInvalidBearer(t *testing.T, baseURL string) int {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL,
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("invalid Bearer probe request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer ck_invalid")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("invalid Bearer probe: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	return response.StatusCode
 }
 
 // probeToolsList issues a well-formed short MCP call and reports its status;
