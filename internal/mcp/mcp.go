@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,7 +34,6 @@ type Option func(*config)
 
 type config struct {
 	maxRequestDuration time.Duration
-	log                *slog.Logger
 }
 
 // WithMaxRequestDuration задаёт потолок времени одного запроса к /mcp.
@@ -42,56 +41,70 @@ func WithMaxRequestDuration(d time.Duration) Option {
 	return func(c *config) { c.maxRequestDuration = d }
 }
 
-// WithLogger задаёт логгер событий с ключами агентов. События выпуска и отзыва
-// обязаны выглядеть одинаково на обоих транспортах: критерий отката ADR 0005
-// разрешим только по ним, а угон украденным ключом с равным успехом идёт через
-// /mcp.
-func WithLogger(log *slog.Logger) Option {
-	return func(c *config) { c.log = log }
-}
-
 // Handler возвращает http.Handler MCP-сервера для монтирования на /mcp.
 // limiter — тот же экземпляр, что у REST: иначе смена транспорта давала бы
 // второй бюджет на те же операции.
 func Handler(svc *core.Service, version string, limiter *ratelimit.Limiter, options ...Option) http.Handler {
-	cfg := config{maxRequestDuration: DefaultMaxRequestDuration, log: slog.Default()}
+	cfg := config{maxRequestDuration: DefaultMaxRequestDuration}
 	for _, option := range options {
 		option(&cfg)
-	}
-	if cfg.log == nil {
-		cfg.log = slog.Default()
 	}
 	server := sdk.NewServer(&sdk.Implementation{
 		Name:    "court",
 		Title:   "Court — дебаты AI-агентов",
 		Version: version,
 	}, nil)
-	registerTools(server, svc, limiter, cfg.log)
+	registerTools(server, svc, limiter)
 
 	mcpHandler := sdk.NewStreamableHTTPHandler(
 		func(*http.Request) *sdk.Server { return server },
 		&sdk.StreamableHTTPOptions{Stateless: true},
 	)
-	// Аутентификация необязательна: register_agent и чтение доступны без ключа,
-	// инструменты-действия сами требуют агента в контексте.
+	// Отсутствующая аутентификация допустима для публичного чтения. Предъявленный
+	// неверный Bearer никогда не понижается до anonymous: клиент должен отличать
+	// потерянный ключ от действительно новой личности.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientIP := limiter.ClientIP(r)
 		ctx := api.WithClientIP(r.Context(), clientIP)
+		// Сначала занимаем адресный слот, ещё до хэширования/поиска Bearer.
+		// Иначе поток случайных неверных ключей обходит transport ceiling и
+		// неограниченно нагружает хранилище аутентификации.
+		release, err := limiter.AcquireStream("", clientIP)
+		if err != nil {
+			api.WriteError(w, err)
+			return
+		}
 		agentID := ""
-		if agent, err := api.AgentFromRequest(svc, r); err == nil {
+		authorization := r.Header.Values("Authorization")
+		if len(authorization) > 0 {
+			if len(authorization) != 1 || strings.TrimSpace(authorization[0]) == "" {
+				release()
+				api.WriteError(w, core.ErrUnauthorized)
+				return
+			}
+			agent, err := api.AgentFromRequest(svc, r)
+			if err != nil {
+				release()
+				api.WriteError(w, err)
+				return
+			}
 			ctx = api.WithAgent(ctx, agent)
 			agentID = agent.ID
+			// Переводим занятый адресный слот в совместный agent+address slot.
+			// Между release/acquire запрос может честно проиграть гонку за
+			// освободившееся место и получить 429; fail-open здесь недопустим.
+			release()
+			release, err = limiter.AcquireStream(agentID, clientIP)
+			if err != nil {
+				api.WriteError(w, err)
+				return
+			}
 		}
 		// Слот занимает транспорт, а не отдельные инструменты: у /mcp есть
 		// долгоживущие методы помимо wait_for_turn (subscriptions/listen —
 		// поток, который держится до разрыва и не требует ключа). Лимит на
 		// уровне инструментов такие потоки не видит.
-		release, err := limiter.AcquireStream(agentID, clientIP)
 		defer release()
-		if err != nil {
-			api.WriteError(w, err)
-			return
-		}
 		// Потолок времени запроса: иначе оборванное соединение держит слот,
 		// пока ОС не закроет сокет, и агент запирает сам себя до рестарта.
 		ctx, cancel := context.WithTimeout(ctx, cfg.maxRequestDuration)
@@ -103,7 +116,7 @@ func Handler(svc *core.Service, version string, limiter *ratelimit.Limiter, opti
 func requireAgent(ctx context.Context) (core.Agent, error) {
 	agent, ok := api.AgentFrom(ctx)
 	if !ok {
-		return core.Agent{}, fmt.Errorf("нужен API-ключ: передайте заголовок Authorization: Bearer <ключ>; ключ выдаёт инструмент register_agent")
+		return core.Agent{}, fmt.Errorf("нужен API-ключ: оператор должен получить или ротировать его через REST вне model-задачи и настроить заголовок Authorization: Bearer <ключ>")
 	}
 	return agent, nil
 }
@@ -131,21 +144,12 @@ func jsonResult(v any) (*sdk.CallToolResult, any, error) {
 
 // --- Входные структуры инструментов ---
 
-type registerIn struct {
-	Name    string `json:"name" jsonschema:"имя агента (до 100 символов)"`
-	Persona string `json:"persona,omitempty" jsonschema:"краткое публичное описание агента"`
-}
-
 type listIn struct {
 	Status string `json:"status,omitempty" jsonschema:"фильтр по статусу: open | running | moderating | concluded"`
 	Limit  int    `json:"limit,omitempty" jsonschema:"максимум записей (по умолчанию 50)"`
 }
 
 type emptyIn struct{}
-
-type revokeCredentialIn struct {
-	CredentialID string `json:"credential_id" jsonschema:"идентификатор ключа (crd_...) из list_credentials"`
-}
 
 type createIn struct {
 	Question       string `json:"question" jsonschema:"вопрос для обсуждения"`
@@ -178,79 +182,22 @@ type postIn struct {
 	SupportAgentID string `json:"support_agent_id,omitempty" jsonschema:"голос: agent_id участника, чью позицию вы сейчас поддерживаете (не указан — свою). В режиме hybrid единогласие голосов завершает дебаты консенсусом"`
 }
 
-func registerTools(server *sdk.Server, svc *core.Service, limiter *ratelimit.Limiter, log *slog.Logger) {
+func registerTools(server *sdk.Server, svc *core.Service, limiter *ratelimit.Limiter) {
 	sdk.AddTool(server, &sdk.Tool{
-		Name: "register_agent",
-		Description: "Зарегистрировать нового агента и получить API-ключ. " +
-			"Ключ показывается один раз — сохраните его и передавайте в заголовке Authorization: Bearer <ключ>.",
-	}, func(ctx context.Context, _ *sdk.CallToolRequest, in registerIn) (*sdk.CallToolResult, any, error) {
-		grant, err := limiter.AllowRegistration(api.ClientIPFrom(ctx))
-		if err != nil {
-			return nil, nil, err
-		}
-		agent, key, err := svc.RegisterAgent(in.Name, in.Persona)
-		if err != nil {
-			refundInvalid(&grant, err)
-			return nil, nil, err
-		}
-		return jsonResult(map[string]any{"agent": agent, "api_key": key})
-	})
-
-	// Ключи агента. Идентичность (agent_id) стабильна и переживает смену
-	// ключа; порядок ротации — выпустить новый, затем отозвать старый.
-	// См. docs/adr/0005-credential-rotation-and-revocation.md.
-	sdk.AddTool(server, &sdk.Tool{
-		Name: "issue_credential",
-		Description: "Выпустить дополнительный API-ключ для себя. agent_id при этом не меняется. " +
-			"Ключ показывается один раз. Это первый шаг ротации: выпустите новый ключ, " +
-			"проверьте его, затем отзовите старый через revoke_credential.",
+		Name: "whoami",
+		Description: "Показать стабильную личность, которой принадлежит текущий ключ: agent_id, имя и публичную persona. " +
+			"Вызывайте перед регистрацией, чтобы не создать второго агента для той же личности.",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, _ emptyIn) (*sdk.CallToolResult, any, error) {
 		agent, err := requireAgent(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		grant, err := limiter.AllowCredentialIssue(agent.ID, api.ClientIPFrom(ctx))
-		if err != nil {
-			return nil, nil, err
-		}
-		credential, key, err := svc.IssueCredential(agent)
-		if err != nil {
-			refundInvalid(&grant, err)
-			return nil, nil, err
-		}
-		api.LogCredentialEvent(log, "выпущен ключ агента", agent, credential.ID, api.ClientIPFrom(ctx))
-		return jsonResult(map[string]any{"credential": credential, "api_key": key})
-	})
-
-	sdk.AddTool(server, &sdk.Tool{
-		Name:        "list_credentials",
-		Description: "Список своих ключей: идентификаторы, время выпуска и отзыва. Сами ключи не хранятся и не показываются.",
-	}, func(ctx context.Context, _ *sdk.CallToolRequest, _ emptyIn) (*sdk.CallToolResult, any, error) {
-		agent, err := requireAgent(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		list, err := svc.Credentials(agent)
-		if err != nil {
-			return nil, nil, err
-		}
-		return jsonResult(map[string]any{"credentials": list})
-	})
-
-	sdk.AddTool(server, &sdk.Tool{
-		Name: "revoke_credential",
-		Description: "Отозвать свой ключ — например утёкший. Последний действующий ключ отозвать нельзя: " +
-			"сначала выпустите новый через issue_credential, иначе идентичность агента станет недоступна навсегда.",
-	}, func(ctx context.Context, _ *sdk.CallToolRequest, in revokeCredentialIn) (*sdk.CallToolResult, any, error) {
-		agent, err := requireAgent(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := svc.RevokeCredential(agent, in.CredentialID); err != nil {
-			return nil, nil, err
-		}
-		api.LogCredentialEvent(log, "отозван ключ агента", agent, in.CredentialID, api.ClientIPFrom(ctx))
-		return jsonResult(map[string]any{"revoked": in.CredentialID})
+		return jsonResult(map[string]any{
+			"agent_id":   agent.ID,
+			"name":       agent.Name,
+			"persona":    agent.Persona,
+			"created_at": agent.CreatedAt,
+		})
 	})
 
 	sdk.AddTool(server, &sdk.Tool{
@@ -323,20 +270,6 @@ func registerTools(server *sdk.Server, svc *core.Service, limiter *ratelimit.Lim
 			return nil, nil, err
 		}
 		return jsonResult(v)
-	})
-
-	sdk.AddTool(server, &sdk.Tool{
-		Name:        "delete_debate",
-		Description: "Удалить дебаты вместе с протоколом (доступно только создателю). Необратимо.",
-	}, func(ctx context.Context, _ *sdk.CallToolRequest, in debateIn) (*sdk.CallToolResult, any, error) {
-		agent, err := requireAgent(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := svc.DeleteDebate(agent, in.DebateID); err != nil {
-			return nil, nil, err
-		}
-		return jsonResult(map[string]any{"deleted": true, "debate_id": in.DebateID})
 	})
 
 	sdk.AddTool(server, &sdk.Tool{
