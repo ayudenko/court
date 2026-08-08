@@ -3,10 +3,7 @@
 package golden
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,8 +17,6 @@ import (
 	"court/internal/store"
 )
 
-const replayLineLimit = 1024 * 1024
-
 var fixedTime = time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 
 // Artifact is one checked-in golden JSONL trace.
@@ -30,10 +25,31 @@ type Artifact struct {
 	Data []byte
 }
 
+// stage is the lifecycle point a scenario is recorded at. Traces of unfinished
+// debates are recorded deliberately: an export is defined for every status, and
+// SPEC.md needs observable evidence for the non-terminal ones rather than prose.
+type stage int
+
+const (
+	// stageOpen records a debate that has not started, where the question is
+	// public but the context is still withheld.
+	stageOpen stage = iota
+	// stagePreparing records the preparation phase, which is entered at start
+	// and left on its own deadline. Recording it needs no clock control because
+	// only leaving it does.
+	stagePreparing
+	// stageRunning records a debate mid-round, after one argument.
+	stageRunning
+	// stageConcluded records a debate that ran to its own end.
+	stageConcluded
+)
+
 type scenario struct {
 	name        string
+	stage       stage
 	mode        core.DebateMode
 	rounds      int
+	prepTime    int
 	question    string
 	description string
 	arguments   [2]string
@@ -42,7 +58,51 @@ type scenario struct {
 
 var scenarios = []scenario{
 	{
+		name:        "open_embargo_v1.jsonl",
+		stage:       stageOpen,
+		mode:        core.ModeModerator,
+		rounds:      3,
+		question:    "Is the discussion context withheld until the debate starts?",
+		description: "Withheld until start: a late joiner must not be able to read this by exporting the debate.",
+		arguments: [2]string{
+			"Never spoken — this debate has not started.",
+			"Never spoken — this debate has not started.",
+		},
+		moderator: scriptedModerator{consensus: true},
+	},
+	{
+		name:  "preparing_phase_v1.jsonl",
+		stage: stagePreparing,
+		// Hybrid, не moderator: ветка C11 «голосов нет и в подготовке» иначе
+		// осталась бы без положительного артефакта — в режиме moderator голосов
+		// не бывает вовсе, и трасса ничего бы о ней не говорила.
+		mode:        core.ModeHybrid,
+		rounds:      2,
+		prepTime:    600,
+		question:    "What does a debate look like while participants are still reading?",
+		description: "Disclosed at start: the preparation phase is when this becomes readable.",
+		arguments: [2]string{
+			"Never spoken — turns have not begun.",
+			"Never spoken — turns have not begun.",
+		},
+		moderator: scriptedModerator{consensus: true},
+	},
+	{
+		name:        "hybrid_running_partial_v1.jsonl",
+		stage:       stageRunning,
+		mode:        core.ModeHybrid,
+		rounds:      2,
+		question:    "Is an unfinished debate a valid artifact?",
+		description: "Exported mid-round: one participant has spoken and the round is not over.",
+		arguments: [2]string{
+			"A partial trace is what an observer of a stuck debate has to work with.",
+			"Never spoken — the export happens before this turn.",
+		},
+		moderator: scriptedModerator{consensus: true},
+	},
+	{
 		name:        "moderator_consensus_v1.jsonl",
+		stage:       stageConcluded,
 		mode:        core.ModeModerator,
 		rounds:      3,
 		question:    "Should protocol traces be reproducible?",
@@ -54,7 +114,21 @@ var scenarios = []scenario{
 		moderator: scriptedModerator{consensus: true},
 	},
 	{
+		name:        "hybrid_multi_round_v1.jsonl",
+		stage:       stageConcluded,
+		mode:        core.ModeHybrid,
+		rounds:      3,
+		question:    "Does a debate that crosses a round boundary stay ordered?",
+		description: "Three rounds: two of them close with a summary, the last with the verdict.",
+		arguments: [2]string{
+			"Round boundaries are where ordering rules stop being trivial.",
+			"Then the reference traces have to contain one.",
+		},
+		moderator: scriptedModerator{consensus: false},
+	},
+	{
 		name:        "hybrid_split_vote_v1.jsonl",
+		stage:       stageConcluded,
 		mode:        core.ModeHybrid,
 		rounds:      1,
 		question:    "Did the participants select one position?",
@@ -85,49 +159,6 @@ func Generate() ([]Artifact, error) {
 	return artifacts, nil
 }
 
-// ReplayJSONL validates a trace and returns its records in canonical order.
-// Re-encoding the result produces the stable representation used by fixtures.
-func ReplayJSONL(data []byte) ([]protocol.ExportRecord, error) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(make([]byte, 0, 64*1024), replayLineLimit)
-	var records []protocol.ExportRecord
-	for line := 1; scanner.Scan(); line++ {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			return nil, fmt.Errorf("line %d: blank JSONL record", line)
-		}
-		var record protocol.ExportRecord
-		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
-			return nil, fmt.Errorf("line %d: decode: %w", line, err)
-		}
-		if err := record.Validate(); err != nil {
-			return nil, fmt.Errorf("line %d: validate: %w", line, err)
-		}
-		records = append(records, record)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read JSONL: %w", err)
-	}
-	if len(records) == 0 {
-		return nil, errors.New("trace contains no records")
-	}
-
-	debate := records[0]
-	var participants, transcript, votes []protocol.ExportRecord
-	for index, record := range records[1:] {
-		switch record.RecordType {
-		case protocol.RecordParticipant:
-			participants = append(participants, record)
-		case protocol.RecordMessage, protocol.RecordRoundSummary, protocol.RecordVerdict:
-			transcript = append(transcript, record)
-		case protocol.RecordVote:
-			votes = append(votes, record)
-		default:
-			return nil, fmt.Errorf("record %d: unexpected type %q after debate", index+2, record.RecordType)
-		}
-	}
-	return protocol.CanonicalStream(debate, participants, transcript, votes)
-}
-
 func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 	database, err := store.Open(":memory:")
 	if err != nil {
@@ -136,6 +167,14 @@ func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 	defer func() {
 		err = errors.Join(err, database.Close())
 	}()
+
+	// Подготовка кончается по дедлайну, а часы у рекордера заморожены: сценарий
+	// с prepTime дальше stagePreparing не уедет, и первый же PostArgument
+	// упрётся в ErrBadState. Ловушка для следующего сценария, а не для этих.
+	if spec.prepTime > 0 && spec.stage != stagePreparing {
+		return nil, fmt.Errorf("scenario %s sets prep time but records stage %d; "+
+			"a frozen clock never ends preparation", spec.name, spec.stage)
+	}
 
 	ids := newDeterministicIDs(strings.TrimSuffix(spec.name, ".jsonl"))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -159,6 +198,7 @@ func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 	created, err := service.CreateDebate(creator, core.CreateDebateParams{
 		Question: spec.question, Description: spec.description, Stance: "record",
 		Mode: spec.mode, Rounds: spec.rounds, TurnTimeoutSec: core.MinTurnTimeout,
+		PrepTimeSec: spec.prepTime,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create debate: %w", err)
@@ -166,20 +206,26 @@ func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 	if _, err := service.JoinDebate(challenger, created.ID, "verify"); err != nil {
 		return nil, fmt.Errorf("join debate: %w", err)
 	}
-	if _, err := service.StartDebate(creator, created.ID); err != nil {
-		return nil, fmt.Errorf("start debate: %w", err)
-	}
 
-	events := service.Subscribe(created.ID)
-	defer service.Unsubscribe(created.ID, events)
-	if _, err := service.PostArgument(context.Background(), creator, created.ID, spec.arguments[0], ""); err != nil {
-		return nil, fmt.Errorf("creator argument: %w", err)
+	wantStatus := core.StatusOpen
+	if spec.stage > stageOpen {
+		if _, err := service.StartDebate(creator, created.ID); err != nil {
+			return nil, fmt.Errorf("start debate: %w", err)
+		}
+		wantStatus = core.StatusPreparing
 	}
-	if _, err := service.PostArgument(context.Background(), challenger, created.ID, spec.arguments[1], ""); err != nil {
-		return nil, fmt.Errorf("challenger argument: %w", err)
-	}
-	if err := waitForConclusion(events); err != nil {
-		return nil, err
+	if spec.stage > stagePreparing {
+		wantStatus = core.StatusRunning
+		if _, err := service.PostArgument(context.Background(), creator, created.ID, spec.arguments[0], ""); err != nil {
+			return nil, fmt.Errorf("creator argument: %w", err)
+		}
+		if spec.stage == stageConcluded {
+			texts := map[string]string{creator.ID: spec.arguments[0], challenger.ID: spec.arguments[1]}
+			if err := runToConclusion(service, created.ID, []core.Agent{creator, challenger}, texts); err != nil {
+				return nil, err
+			}
+			wantStatus = core.StatusConcluded
+		}
 	}
 
 	// Трасса собирается тем же снимком и тем же продюсером, что и ответ
@@ -187,27 +233,46 @@ func recordScenario(spec scenario) (_ []protocol.ExportRecord, err error) {
 	// генератора фикстур, а не формат сервера.
 	snapshot, err := service.ExportSnapshot(context.Background(), created.ID)
 	if err != nil {
-		return nil, fmt.Errorf("read concluded debate: %w", err)
+		return nil, fmt.Errorf("read debate: %w", err)
 	}
-	if snapshot.Debate.Status != core.StatusConcluded {
-		return nil, fmt.Errorf("status = %q, want %q", snapshot.Debate.Status, core.StatusConcluded)
+	if snapshot.Debate.Status != wantStatus {
+		return nil, fmt.Errorf("status = %q, want %q", snapshot.Debate.Status, wantStatus)
 	}
 	return protocol.Stream(snapshot)
 }
 
-func waitForConclusion(events <-chan core.Event) error {
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for {
-		select {
-		case event := <-events:
-			if event.Type == core.EventConcluded {
-				return nil
-			}
-		case <-timer.C:
-			return errors.New("scenario did not conclude")
+// runToConclusion speaks as whoever holds the turn until the debate ends, so a
+// scenario spanning several rounds needs no script of its own. Moderation runs
+// in its own goroutine, so the loop waits rather than assuming the next turn is
+// already open. The recorded bytes stay deterministic regardless of that timing:
+// turn order is fixed, and each agent always says the same thing.
+func runToConclusion(service *core.Service, debateID string, agents []core.Agent, texts map[string]string) error {
+	byID := make(map[string]core.Agent, len(agents))
+	for _, agent := range agents {
+		byID[agent.ID] = agent
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		view, err := service.GetDebate(debateID)
+		if err != nil {
+			return fmt.Errorf("read debate: %w", err)
+		}
+		if view.Status == core.StatusConcluded {
+			return nil
+		}
+		if view.Status != core.StatusRunning || view.TurnAgentID == "" {
+			time.Sleep(time.Millisecond) // moderation between rounds
+			continue
+		}
+		speaker, ok := byID[view.TurnAgentID]
+		if !ok {
+			return fmt.Errorf("turn belongs to unknown agent %q", view.TurnAgentID)
+		}
+		if _, err := service.PostArgument(context.Background(), speaker, debateID, texts[speaker.ID], ""); err != nil {
+			return fmt.Errorf("argument of %s: %w", speaker.Name, err)
 		}
 	}
+	return errors.New("scenario did not conclude")
 }
 
 type deterministicIDs struct {

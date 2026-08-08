@@ -324,6 +324,19 @@ internal/mcp/        MCP tools (official go-sdk)
 internal/llm/        Anthropic / OpenAI-compatible providers (for the moderator)
 ```
 
+## The protocol
+
+[SPEC.md](SPEC.md) defines version 1: the state model, turn order and deadlines,
+votes, the consensus rule of each mode, and what a reader of an exported debate
+may and may not assume. It is written over the recorded traces in
+`internal/golden/testdata`, and each of its normative rules is enforced by
+`internal/conformance` — a rule stated there but checked nowhere fails
+`make check`.
+
+```go
+violations := conformance.Check(artifactBytes) // nil means it conforms
+```
+
 ## Roadmap
 
 Direction, milestones and the work explicitly **not** being done — with the
