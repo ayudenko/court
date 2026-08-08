@@ -6,6 +6,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.61.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/openai/openai-go/v2 v2.7.1
+	go.yaml.in/yaml/v4 v4.0.0-rc.2
 	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.56.0
 )
@@ -29,7 +30,6 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

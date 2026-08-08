@@ -116,25 +116,40 @@ live overrides take precedence.
 ### Docker Compose (local test environment)
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # or put it in a .env file
-
 # server only (REST + MCP on localhost:8080)
 docker compose up --build
+```
 
-# server plus three demo agents that run a full debate by themselves
+#### Zero-token hybrid demo
+
+The default demo needs no LLM credential at all:
+
+```bash
 docker compose --profile demo up --build
 ```
 
-The demo profile starts the agents Pragmatist, Visionary and Sceptic: the first
-creates a debate (the question comes from `DEMO_QUESTION`, microservices by
-default), the others find it and join, and then all three argue over REST,
-generating their arguments with Claude. The transcript is printed to the agent
-logs when the debate finishes; server data lives in the `court-data` volume.
+It starts the server without a moderator key and the agents Pragmatist,
+Visionary and Sceptic with built-in scripted arguments. The first creates a
+`hybrid` debate, the others join, and all three go through the real REST turn
+loop and vote for Pragmatist's reversible-pilot position. The server reaches
+consensus and builds the verdict deterministically from those votes. No model
+is called by either the server or the participants, so the run is reproducible
+and spends zero tokens. The transcript is printed to the agent logs when the
+debate finishes; server data lives in the `court-data` volume.
+
+Docker Compose deliberately accepts moderator and participant credentials only
+through separate, explicit variables. To replace the scripted participants
+with Claude, set `DEMO_AGENT_PROVIDER=anthropic` and
+`DEMO_AGENT_ANTHROPIC_API_KEY`; to add an Anthropic moderator, set
+`COURT_MODERATOR_API_KEY`. Either opt-in can incur model usage.
 
 Demo profile variables: `DEMO_QUESTION`, `DEMO_MODE` (`moderator`/`hybrid`),
-`DEMO_ROUNDS` (default 2), `DEMO_TURN_TIMEOUT` (default 120 seconds). In
-`hybrid` mode the demo agents vote: the LLM is asked to end its answer with the
-line `ПОДДЕРЖИВАЮ: <name>`, and the agent strips the marker and sends the vote.
+`DEMO_ROUNDS` (default 2), `DEMO_TURN_TIMEOUT` (default 120 seconds), plus
+`DEMO_AGENT_PROVIDER`, `DEMO_AGENT_MODEL`, `DEMO_AGENT_BASE_URL`,
+`DEMO_AGENT_ANTHROPIC_API_KEY`, and `DEMO_AGENT_OPENAI_API_KEY` for the opt-in
+LLM-backed participants. In `hybrid` mode an LLM-backed demo agent is asked to
+end its answer with `ПОДДЕРЖИВАЮ: <name>`; the client strips the marker and
+sends the vote.
 
 The demo agent (`cmd/demo-agent`) doubles as a working REST client example:
 registration → create/find a debate → the `wait_for_turn → post_argument` loop.
