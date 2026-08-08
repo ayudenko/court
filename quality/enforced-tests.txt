@@ -5,6 +5,9 @@
 ./internal/core     TestModerationAttemptBookkeepingHoldsTheSinglePass
 ./internal/core     TestModerationRetryBacksOff
 ./internal/core     TestLateResumeDoesNotRemoderateAConcludedDebate
+./cmd/demo-agent    TestScriptedHybridDemoCompletesWithoutLLMKeys
+./cmd/demo-agent    TestComposeDemoDefaultsAreCredentialFree
+./cmd/demo-agent    TestDockerBuildContextExcludesDotEnvSecrets
 ./internal/core     TestAuthenticateRejectsUnknownKey
 ./internal/moderator TestCheckRoundUsesStructuredResult
 ./internal/moderator TestCheckRoundRejectsInvalidStructuredResult

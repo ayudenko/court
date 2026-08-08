@@ -234,10 +234,20 @@ operator's spend that no consumer can check, because the spend counter is not in
 the artifact. `unreachable` is the cause no stored record contradicts. An operator
 who needs the distinction reads the service log, where it is a separate field.
 
-This is what makes hybrid with no LLM key on the server — a supported deployment
-in which *every* round summary is absent — a readable artifact rather than an
-apparently truncated one. `hybrid_no_moderator_v1.jsonl` is that deployment
-recorded.
+### Hybrid with no server-side LLM
+
+Hybrid with no LLM key on the server is a supported deployment, not a partial
+moderator configuration. Participant votes remain the only consensus authority;
+the service advances every turn and round normally, reaches early consensus on
+unanimity, and always derives its final verdict from those votes. No model result
+is required anywhere in that lifecycle.
+
+In a multi-round debate *every* intermediate summary may therefore be absent.
+The degradation messages above make its artifact readable rather than apparently
+truncated, and the final `system` verdict makes the outcome explicit.
+`hybrid_no_moderator_v1.jsonl` records this complete deployment path. Its
+reference scenario and the shipped scripted demo complete without a
+credentialed LLM call, so they are reproducible without token spend.
 
 **A summary absent for any other reason is absent by design, and says nothing.**
 A round that ends the debate has no summary, because the verdict is its result: a

@@ -9,9 +9,11 @@
 //	AGENT_NAME          имя агента (обязательно)
 //	AGENT_PERSONA       позиция/характер для системного промпта
 //	AGENT_STANCE        публичная позиция в дебатах
-//	AGENT_PROVIDER      anthropic | openai (по умолчанию anthropic)
+//	AGENT_PROVIDER      anthropic | openai | scripted (по умолчанию anthropic)
 //	AGENT_MODEL         модель (по умолчанию claude-opus-5)
 //	AGENT_BASE_URL      base URL для openai-совместимых API
+//	AGENT_SCRIPT        готовая реплика для provider=scripted
+//	AGENT_SUPPORT_NAME  имя участника, за которого голосует scripted-провайдер
 //	DEBATE_QUESTION     если задан — агент создаёт и запускает дебаты
 //	DEBATE_DESCRIPTION  контекст дискуссии (для создателя)
 //	DEBATE_MODE         moderator | hybrid (по умолчанию moderator)
@@ -375,9 +377,45 @@ func buildProvider() (llm.Provider, error) {
 		return llm.NewAnthropicProvider("", model, 4096), nil
 	case "openai":
 		return llm.NewOpenAICompatProvider("", os.Getenv("AGENT_BASE_URL"), model, 4096), nil
+	case "scripted":
+		argument := strings.TrimSpace(os.Getenv("AGENT_SCRIPT"))
+		if argument == "" {
+			return nil, errors.New("AGENT_SCRIPT обязателен для AGENT_PROVIDER=scripted")
+		}
+		return scriptedProvider{
+			argument: argument,
+			support:  strings.TrimSpace(os.Getenv("AGENT_SUPPORT_NAME")),
+		}, nil
 	default:
-		return nil, fmt.Errorf("AGENT_PROVIDER: ожидается anthropic или openai")
+		return nil, fmt.Errorf("AGENT_PROVIDER: ожидается anthropic, openai или scripted")
 	}
+}
+
+// scriptedProvider делает бесплатный demo-профиль воспроизводимым: он не
+// читает ключи, не открывает сеть и возвращает заранее заданную реплику. Это не
+// заглушка серверного модератора — участник по-прежнему проходит весь REST-цикл
+// регистрации, ожидания хода, публикации аргумента и голосования.
+type scriptedProvider struct {
+	argument string
+	support  string
+}
+
+func (p scriptedProvider) Stream(_ context.Context, _ string, _ []llm.Message,
+	onDelta func(string)) (string, error) {
+	result := p.argument
+	if p.support != "" {
+		result += "\n\nПОДДЕРЖИВАЮ: " + p.support
+	}
+	if onDelta != nil {
+		onDelta(result)
+	}
+	return result, nil
+}
+
+func (scriptedProvider) CallTool(context.Context, string, []llm.Message, llm.Tool) (
+	json.RawMessage, llm.Usage, error,
+) {
+	return nil, llm.Usage{}, errors.New("scripted provider does not support tool calls")
 }
 
 func retry(ctx context.Context, attempts int, delay time.Duration, fn func() error) error {
