@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"court/internal/conformance"
 	"court/internal/core"
-	"court/internal/golden"
 	"court/internal/protocol"
 	"court/internal/ratelimit"
 	"court/internal/store"
@@ -43,7 +43,7 @@ func TestExportedDebateIsAValidGoldenTrace(t *testing.T) {
 	}
 
 	body := recorder.Body.Bytes()
-	replayed, err := golden.ReplayJSONL(body)
+	replayed, err := protocol.DecodeJSONL(body)
 	if err != nil {
 		t.Fatalf("exported debate is not a replayable trace: %v", err)
 	}
@@ -95,6 +95,46 @@ func TestExportedDebateIsAValidGoldenTrace(t *testing.T) {
 	if !strings.Contains(string(body), creator.ID) || !strings.Contains(string(body), challenger.ID) {
 		t.Fatal("export does not name both participants")
 	}
+}
+
+// TestExportedArtifactConformsToSpec проверяет живой HTTP-ответ против
+// нормативных правил SPEC.md, а не только checked-in трассы. Трассы записывает
+// внутренний генератор; сюда же приходит то, что реально уезжает наружу. Все
+// три статуса проверяются потому, что экспорт определён для любого из них, и
+// незавершённые дебаты — обычный артефакт, а не краевой случай.
+func TestExportedArtifactConformsToSpec(t *testing.T) {
+	server, mux := newLimitedServer(t, ratelimit.Config{})
+	_, creatorKey := registerWithPersona(t, server, "Architect", "Argues for reproducible evidence.")
+	_, challengerKey := registerWithPersona(t, server, "Reviewer", "Challenges silent nondeterminism.")
+
+	debateID := createDebateWithDescription(t, mux, creatorKey, "Контекст дискуссии.")
+	requireConformingExport(t, mux, debateID, "open")
+
+	joinDebate(t, mux, debateID, challengerKey)
+	startDebate(t, mux, debateID, creatorKey)
+	postArgument(t, mux, debateID, creatorKey, "Незавершённые дебаты — тоже артефакт.")
+	requireConformingExport(t, mux, debateID, "running")
+
+	postArgument(t, mux, debateID, challengerKey, "Согласен, если правила проверяемы.")
+	waitForConclusion(t, server, debateID)
+	requireConformingExport(t, mux, debateID, "concluded")
+}
+
+func requireConformingExport(t *testing.T, mux *http.ServeMux, debateID, stage string) {
+	t.Helper()
+	recorder := export(mux, debateID)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("export at stage %s: status = %d, body = %q", stage, recorder.Code, recorder.Body.String())
+	}
+	violations := conformance.Check(recorder.Body.Bytes())
+	if len(violations) == 0 {
+		return
+	}
+	lines := make([]string, 0, len(violations))
+	for _, violation := range violations {
+		lines = append(lines, "  "+violation.String())
+	}
+	t.Fatalf("export at stage %s violates SPEC.md:\n%s", stage, strings.Join(lines, "\n"))
 }
 
 // TestExportWithholdsWhatTheDebateViewWithholds — экспорт собирается из того же
@@ -311,6 +351,13 @@ func TestWorstCaseExportFitsTheDeclaredBudget(t *testing.T) {
 		t.Fatalf("worst-case export is %d bytes, over the declared %d the ceiling is derived from",
 			len(data), MaxExportBytes)
 	}
+	// Тот же артефакт обязан проходить обратно через читателя протокола.
+	// Предел чтения — публичное правило C0, и сервер, отдающий больше, чем его
+	// собственный ридер принимает, зажигал бы это правило на корректном
+	// прогоне: не отказ клиенту, а спецификация, противоречащая реализации.
+	if _, err := protocol.DecodeRecords(data); err != nil {
+		t.Fatalf("worst-case export does not survive the protocol reader: %v", err)
+	}
 }
 
 // TestExportCeilingRefusalIsObservable — потолок на процесс ограничивает всех
@@ -480,9 +527,9 @@ func exportedDebateRecord(t *testing.T, mux *http.ServeMux, debateID string) pro
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("export status = %d, body = %q", recorder.Code, recorder.Body.String())
 	}
-	records, err := golden.ReplayJSONL(recorder.Body.Bytes())
+	records, err := protocol.DecodeJSONL(recorder.Body.Bytes())
 	if err != nil {
-		t.Fatalf("ReplayJSONL: %v", err)
+		t.Fatalf("DecodeJSONL: %v", err)
 	}
 	if len(records) == 0 || records[0].Debate == nil {
 		t.Fatal("export does not start with a debate record")
@@ -540,7 +587,12 @@ func concludedDebate(t *testing.T, server *Server, mux *http.ServeMux, creatorKe
 	startDebate(t, mux, debateID, creatorKey)
 	postArgument(t, mux, debateID, creatorKey, "Экспорт обязан воспроизводиться.")
 	postArgument(t, mux, debateID, challengerKey, "Согласен, если порядок записей детерминирован.")
+	waitForConclusion(t, server, debateID)
+	return debateID
+}
 
+func waitForConclusion(t *testing.T, server *Server, debateID string) {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		view, err := server.svc.GetDebate(debateID)
@@ -548,7 +600,7 @@ func concludedDebate(t *testing.T, server *Server, mux *http.ServeMux, creatorKe
 			t.Fatalf("GetDebate: %v", err)
 		}
 		if view.Status == core.StatusConcluded {
-			return debateID
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("debate did not conclude, status = %q", view.Status)

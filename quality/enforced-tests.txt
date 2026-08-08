@@ -1,5 +1,6 @@
 # Go package       Test named as enforced in AGENTS.md
 ./internal/core     TestDebateStateMachineReachesConsensus
+./internal/store    TestTurnOrderSurvivesSubSecondJoinTimes
 ./internal/core     TestAuthenticateRejectsUnknownKey
 ./internal/moderator TestCheckRoundUsesStructuredResult
 ./internal/moderator TestCheckRoundRejectsInvalidStructuredResult
@@ -25,6 +26,7 @@
 ./internal/api      TestExportedDebateIsAValidGoldenTrace
 ./internal/api      TestExportBytesAreExactlyTheSharedProducerOutput
 ./internal/api      TestExportWithholdsWhatTheDebateViewWithholds
+./internal/api      TestWorstCaseExportFitsTheDeclaredBudget
 ./internal/api      TestExportSharesTheAddressStreamBudget
 ./internal/api      TestExportIsRefusedWhenTheProcessCeilingIsFull
 ./internal/api      TestExportWriteCannotPinTheCeilingForever
@@ -33,5 +35,11 @@
 ./internal/core     TestExportSnapshotLeavesTheQueueWhenTheCallerIsGone
 ./internal/core     TestExportSnapshotDoesNotMixTwoMoments
 ./internal/core     TestExportSnapshotFailsInsteadOfDroppingVotes
+./internal/conformance TestEveryGoldenTraceConformsToSpec
+./internal/conformance TestConformanceRejectsEachViolation
+./internal/conformance TestEverySpecRuleIsEnforcedAndDocumented
+./internal/conformance TestSpecStatesTheLimitsItIsCheckedAgainst
+./internal/conformance TestCheckRecordsEnforcesTheWholeStream
+./internal/api      TestExportedArtifactConformsToSpec
 ./internal/store    TestRevocationTombstonesTheRollbackShadow
 ./internal/store    TestTombstonedShadowSurvivesThePreviousBinaryMigration

@@ -901,3 +901,104 @@ func legacySchemaFingerprint(t *testing.T, db *sql.DB) string {
 	}
 	return string(data)
 }
+
+// TestTurnOrderSurvivesSubSecondJoinTimes pins the one equivalence rule C4 of
+// SPEC.md rests on: the turn order the service takes from storage must be the
+// order a reader recovers from the artifact by sorting on joined_at.
+//
+// The two are computed by different engines. Storage orders with SQL over
+// whatever text the driver wrote; a reader orders time.Time values parsed from
+// RFC 3339. Those agree only as long as the stored layout sorts lexically the
+// way the instants sort — which a whole second and a fraction of the same second
+// are the adversarial case for, since the character after the seconds differs.
+// Nothing else in the tree states this dependency, and C4 is a published rule:
+// were it to break, correct debates would export artifacts that fail their own
+// conformance suite.
+//
+// One layout this cannot catch is a local-time one whose offset suffix varies
+// between rows. That stays out of reach because AddParticipant is only ever
+// called with the service's UTC clock, so every row shares one offset by
+// construction; a change there needs its own fixture.
+func TestTurnOrderSurvivesSubSecondJoinTimes(t *testing.T) {
+	database, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	base := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	joins := []struct {
+		agentID string
+		at      time.Time
+	}{
+		{"agt_4_later_second", base.Add(time.Second)},
+		{"agt_2_quarter", base.Add(250 * time.Millisecond)},
+		{"agt_1_whole_second", base}, // no fractional part at all
+		{"agt_3_half", base.Add(500 * time.Millisecond)},
+	}
+	for _, join := range joins {
+		agent := core.Agent{ID: join.agentID, Name: join.agentID, CreatedAt: base}
+		credential := core.Credential{ID: "crd_" + join.agentID, AgentID: join.agentID, CreatedAt: base}
+		if err := database.CreateAgent(agent, credential, "hash_"+join.agentID); err != nil {
+			t.Fatalf("CreateAgent(%s): %v", join.agentID, err)
+		}
+	}
+	debate := core.Debate{
+		ID: "dbt_join_order", Question: "q", Mode: core.ModeHybrid, Status: core.StatusOpen,
+		Rounds: 1, TurnTimeout: 30, CreatorID: joins[0].agentID, CreatedAt: base,
+	}
+	if err := database.CreateDebate(debate); err != nil {
+		t.Fatalf("CreateDebate: %v", err)
+	}
+	// Inserted out of chronological order so a passing result cannot come from
+	// insertion order standing in for the comparison under test.
+	for _, join := range joins {
+		if err := database.AddParticipant(debate.ID, join.agentID, "", join.at); err != nil {
+			t.Fatalf("AddParticipant(%s): %v", join.agentID, err)
+		}
+	}
+
+	stored, err := database.Participants(debate.ID)
+	if err != nil {
+		t.Fatalf("Participants: %v", err)
+	}
+	if len(stored) != len(joins) {
+		t.Fatalf("participant count = %d, want %d", len(stored), len(joins))
+	}
+
+	// The reader's rule, applied to what the artifact carries. This mirrors
+	// conformance.turnOrder by hand — internal/store importing the conformance
+	// package would be backwards layering — so the two must be edited together:
+	// dropping the agent_id tie-break or the Equal guard there while leaving this
+	// copy intact would keep this test green while C4 broke on real artifacts.
+	recovered := append([]core.Participant(nil), stored...)
+	sort.SliceStable(recovered, func(i, j int) bool {
+		if !recovered[i].JoinedAt.Equal(recovered[j].JoinedAt) {
+			return recovered[i].JoinedAt.Before(recovered[j].JoinedAt)
+		}
+		return recovered[i].AgentID < recovered[j].AgentID
+	})
+	for i := range stored {
+		if stored[i].AgentID != recovered[i].AgentID {
+			t.Fatalf("turn order position %d: storage says %s, joined_at ordering says %s\nstorage: %s\nreader:  %s",
+				i, stored[i].AgentID, recovered[i].AgentID, agentIDs(stored), agentIDs(recovered))
+		}
+	}
+	// The agent that joined on an exact second must not sort after one that
+	// joined later in the same second: that is the pair the layouts disagree on.
+	if stored[0].AgentID != "agt_1_whole_second" {
+		t.Fatalf("first turn goes to %s; the earliest join is agt_1_whole_second", stored[0].AgentID)
+	}
+}
+
+func agentIDs(participants []core.Participant) string {
+	names := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		names = append(names, participant.AgentID)
+	}
+	return strings.Join(names, ", ")
+}

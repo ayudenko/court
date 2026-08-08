@@ -16,8 +16,8 @@ func TestGenerateMatchesCheckedInGoldenTraces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	if len(artifacts) != 2 {
-		t.Fatalf("artifact count = %d, want 2", len(artifacts))
+	if len(artifacts) != len(scenarios) {
+		t.Fatalf("artifact count = %d, want %d", len(artifacts), len(scenarios))
 	}
 	manifest, err := os.ReadFile(filepath.Join("testdata", ".golden-manifest"))
 	if err != nil {
@@ -42,9 +42,9 @@ func TestGenerateMatchesCheckedInGoldenTraces(t *testing.T) {
 				t.Fatalf("generated trace differs from %s; run make golden", artifact.Name)
 			}
 
-			replayed, err := ReplayJSONL(checkedIn)
+			replayed, err := protocol.DecodeJSONL(checkedIn)
 			if err != nil {
-				t.Fatalf("ReplayJSONL: %v", err)
+				t.Fatalf("DecodeJSONL: %v", err)
 			}
 			roundTrip, err := protocol.MarshalJSONL(replayed)
 			if err != nil {
@@ -81,7 +81,15 @@ func TestReplayCanonicalizesRecordOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	trace := artifacts[1].Data
+	var trace []byte
+	for _, artifact := range artifacts {
+		if artifact.Name == "hybrid_split_vote_v1.jsonl" {
+			trace = artifact.Data
+		}
+	}
+	if trace == nil {
+		t.Fatal("hybrid_split_vote_v1.jsonl is missing; this test permutes its records")
+	}
 	lines := strings.Split(strings.TrimSuffix(string(trace), "\n"), "\n")
 	if len(lines) != 8 {
 		t.Fatalf("hybrid trace line count = %d, want 8", len(lines))
@@ -90,9 +98,9 @@ func TestReplayCanonicalizesRecordOrder(t *testing.T) {
 		lines[0], lines[2], lines[1], lines[4], lines[3], lines[5], lines[7], lines[6],
 	}, "\n") + "\n"
 
-	replayed, err := ReplayJSONL([]byte(permuted))
+	replayed, err := protocol.DecodeJSONL([]byte(permuted))
 	if err != nil {
-		t.Fatalf("ReplayJSONL: %v", err)
+		t.Fatalf("DecodeJSONL: %v", err)
 	}
 	canonical, err := protocol.MarshalJSONL(replayed)
 	if err != nil {
@@ -105,7 +113,7 @@ func TestReplayCanonicalizesRecordOrder(t *testing.T) {
 
 func TestReplayRejectsMissingSchemaVersion(t *testing.T) {
 	trace := []byte(`{"record_type":"debate","debate_id":"dbt_test","debate":{"question":"Q","mode":"moderator","status":"open","rounds":1,"current_round":0,"turn_timeout_sec":30,"creator_id":"agt_test","consensus":false,"created_at":"2026-08-06T12:00:00Z"}}` + "\n")
-	if _, err := ReplayJSONL(trace); err == nil || !strings.Contains(err.Error(), "schema_version") {
-		t.Fatalf("ReplayJSONL error = %v, want missing schema_version rejection", err)
+	if _, err := protocol.DecodeJSONL(trace); err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("DecodeJSONL error = %v, want missing schema_version rejection", err)
 	}
 }
