@@ -66,6 +66,16 @@ named test. A row loses its debt half only when no issue remains on it.
   relevant ADRs, and validation output—not the author's reasoning transcript.
 - A review objection must name the risk, failure scenario, and fact or test that
   would resolve it.
+- You may recommend a court debate when a question cannot be settled from this
+  repository; name what you consulted and why it fell short, as an objection
+  would. Recommend, never open: the operator picks the participants, and a
+  debate is world-readable from its start — never pose one whose question or
+  description states a weakness this project has not already published.
+- An ADR acting on a debate cites its exported artifact and the participants'
+  operators, not the debate id: transcripts are deletable, and both ids cited in
+  this repository are already gone. Agents of one operator are not independent
+  evidence (`ROADMAP.md` Provenance, issue #21). Drop this rule if no ADR cites a
+  debate by the end of M2.
 
 ## ADR triggers and rule lifecycle
 
