@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +30,36 @@ const (
 	// раунда оставлял вердикту мёртвый контекст, и тот списывал оценку за запрос,
 	// который вообще не был отправлен.
 	moderationTimeout = 3 * time.Minute
+
+	// backgroundTick — период фонового прохода: истёкшие дедлайны ходов и
+	// возобновление зависшей модерации.
+	backgroundTick = 2 * time.Second
+
+	// moderationRetryDelay — пауза перед первым повтором зависшего прохода
+	// модерации. Зависает он на отказе хранилища, поэтому повтор без паузы упёрся
+	// бы в тот же отказ на следующем тике, а в режиме moderator ещё и оплачивал бы
+	// этим вызов модели каждые две секунды.
+	moderationRetryDelay = time.Minute
+
+	// moderationRetryMaxDelay — потолок паузы. Пауза удваивается с каждой
+	// неудачей: число повторов не ограничено, а каждый читает протокол целиком, и
+	// отказ хранилища задевает сразу все пишущие дебаты. Постоянная минута
+	// означала бы, что сломанный том получает полное чтение каждых зависших
+	// дебатов каждую минуту неограниченно долго; потолок в четверть часа оставляет
+	// восстановление быстрым, а долгую аварию — дешёвой.
+	moderationRetryMaxDelay = 15 * time.Minute
+
+	// moderationMaxPaidPasses — сколько проходов одного раунда вправе заплатить за
+	// вызов модели. Ограничены именно платные проходы: считать надо деньги, а не
+	// живость, и повтор, который модель не зовёт, ничего не стоит и потому не
+	// ограничен ничем. Достигнув потолка, раунд продолжает повторяться бесплатно
+	// и доезжает до детерминированного итога — так же, как при исчерпанном
+	// бюджете дебатов.
+	//
+	// Страховка на случай снятого потолка расхода: с потолком платные повторы
+	// ограничивает он сам (docs/adr/0004-moderator-spend-ceiling.md), без него —
+	// только это число.
+	moderationMaxPaidPasses = 10
 
 	// ModerationPromptOverheadBytes — запас на системную инструкцию, обвязку
 	// промпта и схему инструмента, которых нет ни в вопросе, ни в протоколе.
@@ -186,7 +217,62 @@ type Service struct {
 
 	// mu сериализует переходы состояний дебатов.
 	mu chan struct{} // семафор на 1 — mutex, совместимый с context
+
+	// moderationMu защищает moderations. Замок отдельный от mu намеренно: решение
+	// «начинать ли проход модерации» принимается на каждом фоновом тике и не
+	// должно вставать в очередь за переходами состояний, которые ждут хранилище.
+	moderationMu sync.Mutex
+	moderations  map[string]*moderationAttempts
+
+	// Параметры фонового прохода. Поля, а не константы, потому что тест обязан
+	// увидеть повтор за миллисекунды, а не за минуту; в собранном сервисе они
+	// всегда равны константам выше.
+	tick              time.Duration
+	moderationRetry   time.Duration
+	moderationPaidCap int
 }
+
+// moderationAttempts — состояние повторов модерации одних дебатов.
+// Живёт только в памяти и только про этот процесс: это «сколько раз я уже
+// пробовал», а не факт дебатов. Рестарт обнуляет счёт намеренно — новый процесс
+// мог подняться именно потому, что причину отказа устранили.
+//
+// Цена этого решения: на развёртывании с auto_stop (fly.toml) процесс встаёт и
+// поднимается сам, и зависшие дебаты получают новый счёт на каждом цикле. Расход
+// при этом остаётся ограничен потолком на дебаты: он лежит в хранилище и цикл
+// его не сбрасывает. Сбрасывается только страховка на случай снятого потолка и
+// признак сломанного учёта — то есть при сломанном учёте цена одного цикла
+// простоя равна одному оплаченному вызову на раунд.
+type moderationAttempts struct {
+	round   int
+	running bool
+	tries   int
+	lastTry time.Time
+	// pass — номер запущенного прохода. Завершившийся проход снимает признак
+	// «идёт» только со своего: горутина прошлого раунда иначе сняла бы его с
+	// живого прохода следующего, и фоновый проход запустил бы второй поверх.
+	pass int
+	// paid — сколько проходов этого раунда заплатили за вызов модели. Повтор,
+	// который не платит, ничем не ограничен: ограничивать надо деньги, а не
+	// живость.
+	paid int
+	// hopeless — раунд отвергнут как неоднозначный: повтор не изменит ничего.
+	hopeless bool
+	// chargeLost — расход состоялся, а записать его не вышло. С этого момента
+	// платить за эти дебаты нельзя: остаток бюджета в хранилище не сдвинулся, и
+	// каждый следующий проход получал бы его заново.
+	chargeLost bool
+}
+
+// moderationTrigger — кто запустил проход модерации. Нужен только логу:
+// возобновление зависшего прохода обязано быть видно оператору, а закрытие
+// раунда — рядовое событие.
+type moderationTrigger string
+
+const (
+	triggerRoundClosed moderationTrigger = "round_closed"
+	triggerResumed     moderationTrigger = "resumed"
+)
 
 // ServiceOption настраивает заменяемые источники недетерминированности.
 // Production использует криптографические ID и системные часы; record/replay
@@ -219,6 +305,10 @@ func NewService(store Storage, hub *Hub, mod Moderator, log *slog.Logger, option
 	s := &Service{
 		store: store, hub: hub, moderator: mod, log: log,
 		now: time.Now, newID: newID, mu: make(chan struct{}, 1),
+		moderations:       make(map[string]*moderationAttempts),
+		tick:              backgroundTick,
+		moderationRetry:   moderationRetryDelay,
+		moderationPaidCap: moderationMaxPaidPasses,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -252,37 +342,250 @@ func (s *Service) lockContext(ctx context.Context) error {
 	}
 }
 
-// Run запускает фоновые процессы: тикер дедлайнов и восстановление
-// зависших модераций после рестарта. Блокируется до отмены ctx.
+// Run запускает фоновые процессы: истёкшие дедлайны ходов и возобновление
+// зависшей модерации. Блокируется до отмены ctx.
 func (s *Service) Run(ctx context.Context) {
-	s.recover(ctx)
-	// Process deadlines once at startup so a turn that expired while the
-	// process was stopped is not left pending until the first ticker tick.
+	// Первый проход сразу, без ожидания тика: ни ход, истёкший пока процесс
+	// стоял, ни модерация, не дошедшая до записи перед остановкой, не должны
+	// ждать лишние секунды.
+	s.resumeStuckModeration(ctx)
 	s.expireTurns(ctx)
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(s.tick)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.resumeStuckModeration(ctx)
 			s.expireTurns(ctx)
 		}
 	}
 }
 
-// recover перезапускает модерацию для дебатов, застрявших в статусе
-// moderating после рестарта сервера.
-func (s *Service) recover(ctx context.Context) {
+// resumeStuckModeration возвращает к жизни дебаты, застрявшие в статусе
+// moderating.
+//
+// Застревают они на отказе хранилища: ветка, которая не смогла записать
+// объяснение исхода, намеренно не завершает дебаты — протокол без этой записи
+// неотличим от усечённого. Пока повтор делался только при старте процесса,
+// выйти из такого состояния можно было единственным способом — перезапустить
+// сервер, а участники всё это время не могли ничего: ход не принадлежит никому
+// и дедлайна нет. Ни одно правило conformance об этом не сообщает, потому что
+// экспорт таких дебатов валиден (issue #40).
+func (s *Service) resumeStuckModeration(ctx context.Context) {
 	debates, err := s.store.ActiveDebates()
 	if err != nil {
-		s.log.Error("восстановление после рестарта", "err", err)
+		s.log.Error("возобновление модерации: чтение дебатов", "err", err)
 		return
 	}
+	active := make(map[string]struct{}, len(debates))
 	for _, d := range debates {
+		active[d.ID] = struct{}{}
 		if d.Status == StatusModerating {
-			s.log.Info("возобновляю модерацию", "debate", d.ID, "round", d.CurrentRound)
-			go s.moderate(ctx, d.ID)
+			s.moderateAsync(ctx, d.ID, d.CurrentRound, triggerResumed)
+		}
+	}
+	s.forgetSettledModeration(active)
+}
+
+// moderateAsync запускает проход модерации, если его ещё не ведёт этот процесс
+// и с прошлой попытки прошла пауза. Единственная точка запуска: и закрытие
+// раунда, и возобновление зависшего проходят через неё, поэтому «модерация уже
+// идёт» — свойство одного счётчика, а не двух независимых путей.
+//
+// Число проходов не ограничено ничем: повтор, который не зовёт модель, ничего не
+// стоит, а ограничить его значило бы снова оставить дебаты ждать рестарта после
+// любого отказа хранилища длиннее лимита. Ограничены платные вызовы — см.
+// affordModelCall.
+func (s *Service) moderateAsync(ctx context.Context, debateID string, round int, trigger moderationTrigger) {
+	pass, ok := s.beginModerationAttempt(debateID, round, trigger)
+	if !ok {
+		return
+	}
+	go func() {
+		defer s.endModerationAttempt(debateID, pass)
+		s.moderate(ctx, debateID)
+	}()
+}
+
+// beginModerationAttempt решает, начинать ли проход, и отмечает его начало.
+// Второе значение — начинаем ли; первое — номер прохода для endModerationAttempt.
+func (s *Service) beginModerationAttempt(debateID string, round int, trigger moderationTrigger) (int, bool) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	attempts := s.moderations[debateID]
+	if attempts == nil {
+		attempts = &moderationAttempts{round: round}
+		s.moderations[debateID] = attempts
+	}
+	if round < attempts.round {
+		// Вызов устарел: фоновый проход прочитал список дебатов до того, как они
+		// ушли вперёд. Начать по нему значит запустить второй проход поверх
+		// живого — с задвоенным расходом модератора и двумя записями на раунд,
+		// вторая из которых сделает раунд неоднозначным навсегда (ADR 0002).
+		return 0, false
+	}
+	// Закрытие нового раунда авторитетнее признака «идёт»: признак снимает
+	// отложенный вызов горутины прошлого прохода, и между её последней записью и
+	// этим вызовом есть окно. Дебаты, доигравшие в нём целый раунд, доказывают,
+	// что прошлый проход своё дело сделал. На сервере с фоновым проходом окно
+	// стоило бы одного тика, а без него — например в записи эталонных трасс, где
+	// Run не запускают, — модерация не началась бы вовсе.
+	//
+	// Держится это на том, что раунд продвигает только сам проход модерации и
+	// только под замком переходов. Путь, продвигающий раунд снаружи прохода —
+	// ручное «следующий раунд», ремонтная утилита, — сломает исключение и даст
+	// второй проход поверх живого: критерий отката 1 из
+	// docs/adr/0008-in-process-moderation-retry.md.
+	takeover := trigger == triggerRoundClosed && round > attempts.round
+	if attempts.running && !takeover {
+		return 0, false
+	}
+	if round > attempts.round {
+		// Новый раунд — свой счёт: и платных проходов, и попыток. Потолок платных
+		// повторов считается на раунд, иначе долгие дебаты доезжали бы до
+		// последнего раунда с уже израсходованным лимитом из-за давно устранённого
+		// сбоя; а несброшенный счёт попыток заставил бы закрытие следующего раунда
+		// ждать паузу между повторами. chargeLost не сбрасывается: он про дебаты
+		// целиком.
+		attempts.round = round
+		attempts.paid = 0
+		attempts.tries = 0
+		attempts.hopeless = false
+	}
+	if attempts.hopeless {
+		// Повторять нечего: раунд отвергнут как неоднозначный, и это состояние не
+		// лечится ни повтором, ни рестартом — только вмешательством в данные.
+		// Повторять его значит читать протокол целиком раз в минуту вечно и
+		// печатать ту же ошибку, топя строку, по которой её замечают.
+		return 0, false
+	}
+	now := s.nowUTC()
+	if attempts.tries > 0 {
+		if now.Sub(attempts.lastTry) < s.retryBackoff(attempts.tries) {
+			return 0, false
+		}
+		s.log.Warn("модерация: повторяю зависший проход",
+			"debate", debateID, "round", round, "try", attempts.tries+1)
+	} else if trigger == triggerResumed {
+		// Первый проход после рестарта: раньше о нём сообщал recover, и без этой
+		// строки возобновление стало бы бесшумным.
+		s.log.Info("модерация: возобновляю зависший проход", "debate", debateID, "round", round)
+	}
+	attempts.running = true
+	attempts.tries++
+	attempts.lastTry = now
+	attempts.pass++
+	return attempts.pass, true
+}
+
+// retryBackoff — пауза перед попыткой номер tries+1. Удвоение с потолком:
+// первые повторы быстрые, потому что типичный отказ хранилища короткий, а долгая
+// авария не должна стоить полного чтения протокола каждую минуту.
+func (s *Service) retryBackoff(tries int) time.Duration {
+	delay := s.moderationRetry
+	if delay <= 0 {
+		// Пауза, отключённая тестом: удваивать нечего, и цикл ниже крутился бы
+		// вхолостую столько раз, сколько было попыток.
+		return 0
+	}
+	for try := 1; try < tries && delay < moderationRetryMaxDelay; try++ {
+		delay *= 2
+	}
+	return min(delay, moderationRetryMaxDelay)
+}
+
+// giveUpOnModeration помечает раунд как неповторяемый.
+func (s *Service) giveUpOnModeration(debateID string) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	if attempts := s.moderations[debateID]; attempts != nil {
+		attempts.hopeless = true
+	}
+}
+
+func (s *Service) endModerationAttempt(debateID string, pass int) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	if attempts := s.moderations[debateID]; attempts != nil && attempts.pass == pass {
+		attempts.running = false
+	}
+}
+
+// noteModerationAdmitted отмечает, что проход получил право на платный вызов.
+func (s *Service) noteModerationAdmitted(debateID string) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	if attempts := s.moderations[debateID]; attempts != nil {
+		attempts.paid++
+	}
+}
+
+// noteChargeLost отмечает, что расход состоялся, а записать его не вышло.
+// Заводит запись, если её нет: молча потерять этот факт значит продолжать
+// платить вслепую — ровно тот отказ, ради которого он и запоминается.
+func (s *Service) noteChargeLost(debateID string) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	attempts := s.moderations[debateID]
+	if attempts == nil {
+		attempts = &moderationAttempts{}
+		s.moderations[debateID] = attempts
+	}
+	attempts.chargeLost = true
+}
+
+// chargeLost сообщает, сломан ли учёт расхода этих дебатов. Отдельное поле в
+// логе, а не вывод из деградации: критерий отката 1 из
+// docs/adr/0004-moderator-spend-ceiling.md считает деградации по исчерпанному
+// потолку, и деградация из-за сломанного учёта в этот счёт попадать не должна —
+// потолок там не срабатывал.
+func (s *Service) chargeLost(debateID string) bool {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	attempts := s.moderations[debateID]
+	return attempts != nil && attempts.chargeLost
+}
+
+// affordModelCall сообщает, вправе ли проход ещё платить за вызов модели, и
+// называет причину отказа для лога. Ответ «нет» не останавливает проход — он
+// уводит его в ту же деградацию, что и недоступный модератор.
+func (s *Service) affordModelCall(debateID string) (reason string, affordable bool) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	attempts := s.moderations[debateID]
+	if attempts == nil {
+		return "", true
+	}
+	// Учёт расхода сломан: следующий вызов невозможно ни ограничить, ни
+	// посчитать. Платить вслепую нельзя — это единственный способ, которым
+	// повтор мог бы превысить потолок дебатов.
+	if attempts.chargeLost {
+		return "charge_lost", false
+	}
+	// Страховка на случай снятого потолка: с ним платные повторы ограничивает
+	// сам потолок, без него — только этот счёт.
+	if attempts.paid >= s.moderationPaidCap {
+		return "paid_cap", false
+	}
+	return "", true
+}
+
+// forgetSettledModeration убирает состояние дебатов, которых уже нет среди
+// активных. Без этого карта росла бы на каждые прошедшие через процесс дебаты:
+// завершённые в ActiveDebates не возвращаются и сами о себе сообщить не могут.
+// Признак «активные», а не «в moderating»: счёт платных повторов и признак
+// сломанного учёта обязаны пережить смену раунда.
+func (s *Service) forgetSettledModeration(active map[string]struct{}) {
+	s.moderationMu.Lock()
+	defer s.moderationMu.Unlock()
+	for id, attempts := range s.moderations {
+		if attempts.running {
+			continue
+		}
+		if _, still := active[id]; !still {
+			delete(s.moderations, id)
 		}
 	}
 }
@@ -318,7 +621,7 @@ func (s *Service) expireTurns(ctx context.Context) {
 		if err == nil {
 			name = agent.Name
 		}
-		if _, err := s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem,
+		if _, err := s.appendMessage(d.ID, d.CurrentRound, "", SystemSpeakerName, KindSystem,
 			fmt.Sprintf("%s пропустил ход (истекло время ответа).", name)); err != nil {
 			s.log.Error("сохранение пропущенного хода", "debate", d.ID, "err", err)
 			continue
@@ -675,7 +978,7 @@ func (s *Service) advanceTurn(ctx context.Context, d Debate) error {
 	}
 	// Контекст здесь — обычно контекст HTTP-запроса агента, закрывшего раунд;
 	// он отменяется сразу после ответа, поэтому модерация живёт без его отмены.
-	go s.moderate(context.WithoutCancel(ctx), d.ID)
+	s.moderateAsync(context.WithoutCancel(ctx), d.ID, d.CurrentRound, triggerRoundClosed)
 	return nil
 }
 
@@ -685,6 +988,13 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	d, err := s.store.GetDebate(debateID)
 	if err != nil {
 		s.log.Error("модерация: чтение дебатов", "debate", debateID, "err", err)
+		return
+	}
+	if d.Status != StatusModerating {
+		// Возобновление опоздало: проход, начатый раньше, уже увёл дебаты дальше.
+		// Без этой проверки повтор переписал бы завершённые дебаты и опубликовал
+		// второе событие о завершении — состояние гонки, которого не было, пока
+		// повтор случался только при старте процесса.
 		return
 	}
 	if d.Mode == ModeHybrid {
@@ -701,6 +1011,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	storedSummary, storedVerdict, err := moderationMessagesForRound(msgs, d.CurrentRound)
 	if err != nil {
 		s.log.Error("модерация: неоднозначные сохранённые результаты", "debate", debateID, "err", err)
+		s.giveUpOnModeration(debateID)
 		return
 	}
 
@@ -711,16 +1022,27 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	} else if !lastRound {
 		if storedSummary != nil {
 			consensus = roundSummaryReachedConsensus(*storedSummary.RoundSummary)
-		} else if !s.moderationAllowed(d, subject(d), transcript) {
-			// Бюджет исчерпан: дискуссия продолжается без промежуточных итогов.
+		} else if committed := committedDegradation(msgs, d.CurrentRound,
+			NoticeBudgetSummary, NoticeUnavailableSummary); committed != "" {
+			// Раунд уже объявил, что итога в нём не будет. Записать его теперь —
+			// значит опровергнуть собственное уведомление: см. committedDegradation.
+			s.log.Info("модерация: раунд уже объявил пропуск итога",
+				"debate", debateID, "round", d.CurrentRound)
+		} else if admission := s.admitModeration(d, subject(d), transcript); admission != admissionAllowed {
+			// Вызова не будет: дискуссия продолжается без промежуточных итогов.
 			// Ходы участников сервису ничего не стоят, поэтому дебаты не рвутся
 			// на середине — они доедут до последнего раунда и завершатся
 			// детерминированным вердиктом.
-			s.log.Warn("модерация: бюджет дебатов исчерпан, итог раунда пропущен",
-				"debate", debateID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
-			if !noticeRecorded(msgs, d.CurrentRound, NoticeBudgetSummary) {
+			notice := NoticeBudgetSummary
+			if admission == admissionUnaffordable {
+				notice = NoticeUnavailableSummary
+			} else {
+				s.log.Warn("модерация: бюджет дебатов исчерпан, итог раунда пропущен",
+					"debate", debateID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
+			}
+			if !noticeRecorded(msgs, d.CurrentRound, notice) {
 				s.lock()
-				_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, NoticeBudgetSummary)
+				_, _ = s.appendMessage(debateID, d.CurrentRound, "", SystemSpeakerName, KindSystem, notice)
 				s.unlock()
 			}
 		} else {
@@ -732,7 +1054,7 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			if err != nil {
 				s.log.Error("модерация: итог раунда", "debate", debateID, "err", err)
 				if !noticeRecorded(msgs, d.CurrentRound, NoticeUnavailableSummary) {
-					_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, NoticeUnavailableSummary)
+					_, _ = s.appendMessage(debateID, d.CurrentRound, "", SystemSpeakerName, KindSystem, NoticeUnavailableSummary)
 				}
 			} else {
 				summary.Consensus = roundSummaryReachedConsensus(summary)
@@ -757,22 +1079,38 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 	if lastRound || consensus || storedVerdict != nil {
 		var verdict ModerationVerdict
 		degraded := false
+		// modelWithheld — модель не высказалась не из-за бюджета этих дебатов:
+		// платить нельзя, либо раунд уже объявил об этом. В этом режиме тогда не
+		// будет и вердикта.
+		modelWithheld := false
+		committed := committedDegradation(msgs, d.CurrentRound,
+			NoticeBudgetVerdictModerator, NoticeUnavailableVerdictModerator)
 		switch {
 		case storedVerdict != nil:
 			verdict = *storedVerdict.Verdict
-		case !s.moderationAllowed(d, subject(d), transcript):
-			// Деградация по бюджету: вердикта модели не будет. Консенсус остаётся
-			// тем, что определили оплаченные итоги раундов, и голоса участников в
-			// этом режиме на исход не влияют.
+		case committed == NoticeBudgetVerdictModerator:
+			// Раунд уже объявил причину и обещал детерминированный вердикт.
 			degraded = true
-			s.log.Warn("модерация: бюджет дебатов исчерпан, вердикт модели не запрашивается",
-				"debate", debateID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
+		case committed == NoticeUnavailableVerdictModerator:
+			modelWithheld = true
 		default:
-			var spent ModerationUsage
-			callCtx, cancelCall := moderationCall(ctx)
-			verdict, spent, err = s.moderator.Verdict(callCtx, subject(d), transcript, allowedSeqs)
-			cancelCall()
-			s.chargeModeration(&d, subject(d), transcript, spent)
+			switch s.admitModeration(d, subject(d), transcript) {
+			case admissionBudgetExhausted:
+				// Деградация по бюджету: вердикта модели не будет. Консенсус остаётся
+				// тем, что определили оплаченные итоги раундов, и голоса участников в
+				// этом режиме на исход не влияют.
+				degraded = true
+				s.log.Warn("модерация: бюджет дебатов исчерпан, вердикт модели не запрашивается",
+					"debate", debateID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
+			case admissionUnaffordable:
+				modelWithheld = true
+			default:
+				var spent ModerationUsage
+				callCtx, cancelCall := moderationCall(ctx)
+				verdict, spent, err = s.moderator.Verdict(callCtx, subject(d), transcript, allowedSeqs)
+				cancelCall()
+				s.chargeModeration(&d, subject(d), transcript, spent)
+			}
 		}
 		s.lock()
 		defer s.unlock()
@@ -789,24 +1127,30 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			degradedVerdict, verdictText := budgetExhaustedVerdict(consensus)
 			verdictNotice = NoticeBudgetVerdictModerator
 			if !noticeRecorded(msgs, d.CurrentRound, NoticeBudgetVerdictModerator) {
-				if _, err := s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, NoticeBudgetVerdictModerator); err != nil {
+				if _, err := s.appendMessage(debateID, d.CurrentRound, "", SystemSpeakerName, KindSystem, NoticeBudgetVerdictModerator); err != nil {
 					s.log.Error("модерация: сохранение уведомления о бюджете", "debate", debateID, "err", err)
 					return
 				}
 			}
-			if _, err := s.appendVerdictText(debateID, d.CurrentRound, "система", degradedVerdict, verdictText); err != nil {
+			if _, err := s.appendVerdictText(debateID, d.CurrentRound, SystemSpeakerName, degradedVerdict, verdictText); err != nil {
 				s.log.Error("модерация: сохранение детерминированного вердикта", "debate", debateID, "err", err)
 				return
 			}
-		case err != nil:
-			s.log.Error("модерация: вердикт", "debate", debateID, "err", err)
+		// err здесь — только ошибка вызова вердикта: блок промежуточного итога
+		// объявляет свою err через `:=`, поэтому его сбой сюда не доходит. Если
+		// это когда-нибудь станет одной переменной, вердикт по сохранённому итогу
+		// уедет в эту ветку и допишет второе, ложное уведомление.
+		case err != nil || modelWithheld:
+			if err != nil {
+				s.log.Error("модерация: вердикт", "debate", debateID, "err", err)
+			}
 			verdictNotice = NoticeUnavailableVerdictModerator
 			// Отказ, а не завершение: без вердикта уведомление — единственная
 			// запись, объясняющая исход, и дебаты, завершённые без неё, ничем не
 			// отличаются от усечённого протокола. Дебаты остаются в moderating, и
-			// recover повторит попытку.
+			// проход повторит resumeStuckModeration.
 			if !noticeRecorded(msgs, d.CurrentRound, NoticeUnavailableVerdictModerator) {
-				if _, err := s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
+				if _, err := s.appendMessage(debateID, d.CurrentRound, "", SystemSpeakerName, KindSystem,
 					NoticeUnavailableVerdictModerator); err != nil {
 					s.log.Error("модерация: сохранение уведомления о недоступности", "debate", debateID, "err", err)
 					return
@@ -821,9 +1165,21 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 		default:
 			consensus = verdict.Consensus
 		}
-		s.log.Info("расход модератора за дебаты", "debate", debateID,
-			"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens,
-			"degraded", degraded, "verdict_degradation", degradationCause(degraded, verdictNotice))
+		// attribution — откуда взялась причина деградации в итоговой строке.
+		// «recovered» значит, что её восстановил повтор из протокола, а не наблюдал
+		// сам проход: тогда `charge_lost` относится к этому процессу, а деградацию
+		// произвёл предыдущий, и читать их как одно нельзя.
+		attribution := "observed"
+		switch {
+		case storedVerdict != nil:
+			attribution = "recovered"
+			degraded, verdictNotice = storedVerdictDegradation(msgs, d.CurrentRound, *storedVerdict,
+				NoticeBudgetVerdictModerator, NoticeUnavailableVerdictModerator)
+		case committed != "":
+			// Причину этот проход тоже не наблюдал: он подчинился уведомлению,
+			// записанному предыдущим, и решения о допуске вызова не принимал.
+			attribution = "recovered"
+		}
 		d.Status = StatusConcluded
 		d.Consensus = consensus
 		d.TurnAgentID = ""
@@ -832,6 +1188,14 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			s.log.Error("модерация: сохранение статуса", "debate", debateID, "err", err)
 			return
 		}
+		// Итог расхода — после успешного завершения, а не до него. Строка одна на
+		// дебаты: по её полю `degraded` считается критерий отката 1 из
+		// docs/adr/0004-moderator-spend-ceiling.md, и повтор незавершившегося
+		// прохода не имеет права её удваивать.
+		s.log.Info("расход модератора за дебаты", "debate", debateID,
+			"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens,
+			"degraded", degraded, "verdict_degradation", degradationCause(degraded, verdictNotice),
+			"charge_lost", s.chargeLost(debateID), "attribution", attribution)
 		s.hub.Publish(Event{Type: EventConcluded, DebateID: debateID, Round: d.CurrentRound, Consensus: consensus})
 		return
 	}
@@ -909,10 +1273,79 @@ func degradationCause(budgetExhausted bool, verdictNotice string) string {
 	}
 }
 
+// storedVerdictDegradation восстанавливает причину, по которой итог подвела не
+// модель, для вердикта, записанного прошлым проходом модерации.
+//
+// Нужна потому, что итоговая строка расхода пишется после успешного перехода в
+// concluded: проход, записавший вердикт и упавший на переходе, не пишет её
+// вовсе, и всё, что оператор увидит, — строка повтора. Повтор же берёт готовый
+// вердикт и сам ничего не деградирует, поэтому без восстановления он отчитался
+// бы «решила модель» о вердикте, которого модель не выносила, и критерий отката
+// 1 из docs/adr/0004-moderator-spend-ceiling.md недосчитался бы сработавшего
+// потолка.
+//
+// Источник истины — протокол: у деградировавшего вердикта спикер «система», а
+// рядом лежит уведомление, называющее причину. Проверка спикера обязательна:
+// уведомление о недоступности пишется и там, где вердикта не будет вовсе, и
+// следующий проход может добавить к нему вердикт модели.
+func storedVerdictDegradation(
+	msgs []Message,
+	round int,
+	stored Message,
+	budgetNotice, unavailableNotice string,
+) (budgetExhausted bool, notice string) {
+	if stored.SpeakerName != SystemSpeakerName {
+		return false, ""
+	}
+	switch {
+	case noticeRecorded(msgs, round, budgetNotice):
+		return true, budgetNotice
+	case noticeRecorded(msgs, round, unavailableNotice):
+		return false, unavailableNotice
+	default:
+		return false, ""
+	}
+}
+
+// SystemSpeakerName — имя говорящего у записей, которые делает сам сервис:
+// пропуск хода, уведомление о деградации, детерминированный вердикт. Константа,
+// а не литерал по месту, потому что по этому имени читается вопрос «вердикт
+// вынесла модель или сервис» (см. storedVerdictDegradation).
+//
+// Экспортируется, чтобы обвязка могла отказать модератору с таким именем: имя
+// модератора задаёт оператор, и совпадение стёрло бы это различие и в логике, и
+// в протоколе.
+const SystemSpeakerName = "система"
+
+// committedDegradation — уведомление о деградации, которое раунд уже записал в
+// протокол, или пустая строка.
+//
+// Уведомление — обещание потребителю: SPEC.md публикует для каждого из них, что
+// именно потеряно и следует ли за ним запись. Проход, повторяющий раунд после
+// сбоя записи, обязан это обещание выполнить, даже если модель к тому моменту
+// снова отвечает. Иначе за «модератор недоступен, итог подведён по голосам»
+// встаёт вердикт модели, а за «в этом раунде нет резюме» — резюме, и артефакт
+// говорит о раунде две разные вещи. Ни одно правило conformance этого не ловит:
+// оба утверждения по отдельности допустимы.
+//
+// До появления фонового повтора такое расхождение требовало рестарта между двумя
+// проходами; с ним это обычный путь того самого сбоя, ради которого повтор и
+// добавлен.
+func committedDegradation(msgs []Message, round int, budgetNotice, unavailableNotice string) string {
+	switch {
+	case noticeRecorded(msgs, round, budgetNotice):
+		return budgetNotice
+	case noticeRecorded(msgs, round, unavailableNotice):
+		return unavailableNotice
+	default:
+		return ""
+	}
+}
+
 // noticeRecorded сообщает, есть ли уже в протоколе это уведомление о деградации
-// за этот раунд. Повторная модерация — после сбоя записи или после рестарта,
-// возобновляющего дебаты в статусе moderating, — не должна дублировать запись,
-// на которой держится читаемость деградации.
+// за этот раунд. Повторный проход модерации — возобновлённый после сбоя записи
+// или после рестарта — не должен дублировать запись, на которой держится
+// читаемость деградации.
 func noticeRecorded(msgs []Message, round int, notice string) bool {
 	for _, message := range msgs {
 		if message.Round == round && message.Kind == KindSystem && message.Text == notice {
@@ -967,14 +1400,49 @@ func moderationCall(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, moderationTimeout)
 }
 
-// moderationAllowed сообщает, укладывается ли следующий вызов модератора в
-// остаток бюджета дебатов. Проверка до вызова, а не после: потолок обязан
-// предотвращать расход, а не обнаруживать его.
-func (s *Service) moderationAllowed(d Debate, question, transcript string) bool {
-	if s.budget.DebateTokens <= 0 {
-		return true
+// moderationAdmission — вердикт по вопросу «звать ли модель», и если нет, то по
+// какой причине. Причин две, и путать их нельзя: в протоколе они публикуются как
+// разные (SPEC.md, колонка Cause), и по одной из них считается критерий отката 1
+// из docs/adr/0004-moderator-spend-ceiling.md.
+type moderationAdmission int
+
+const (
+	// admissionAllowed — вызов разрешён и учтён как платный.
+	admissionAllowed moderationAdmission = iota
+	// admissionBudgetExhausted — на вызов не хватает бюджета этих дебатов.
+	admissionBudgetExhausted
+	// admissionUnaffordable — платить нельзя по причине, не связанной с бюджетом
+	// дебатов: сломан учёт расхода или исчерпан потолок платных повторов раунда.
+	// Для протокола это «модератор недоступен», а не «бюджет исчерпан»: бюджет
+	// здесь не тратился и может быть почти нетронут, а утверждать обратное значит
+	// публиковать ложную причину.
+	admissionUnaffordable
+)
+
+// admitModeration решает судьбу следующего вызова модели и, разрешая его,
+// сразу засчитывает как платный.
+//
+// Счёт ведётся на допуске, а не на списании: вызов, ушедший к провайдеру и не
+// вернувший ответ, списания не даёт (ADR 0004 считает его неоплаченным), но
+// провайдер мог его выполнить, и повтор, считающий только списания, повторял бы
+// такой вызов вечно.
+//
+// Проверка до вызова, а не после: потолок обязан предотвращать расход, а не
+// обнаруживать его.
+func (s *Service) admitModeration(d Debate, question, transcript string) moderationAdmission {
+	// Ограничения повторов спрашивают первыми: они действуют и при снятом
+	// потолке, потому что ограничивают не эти дебаты, а цену собственной живости.
+	if reason, affordable := s.affordModelCall(d.ID); !affordable {
+		s.log.Warn("модерация: платный вызов модели невозможен",
+			"debate", d.ID, "round", d.CurrentRound, "reason", reason)
+		return admissionUnaffordable
 	}
-	return d.ModeratorTokens+s.estimateModerationTokens(question, transcript) <= s.budget.DebateTokens
+	if s.budget.DebateTokens > 0 &&
+		d.ModeratorTokens+s.estimateModerationTokens(question, transcript) > s.budget.DebateTokens {
+		return admissionBudgetExhausted
+	}
+	s.noteModerationAdmitted(d.ID)
+	return admissionAllowed
 }
 
 // chargeModeration списывает расход вызова с бюджета дебатов.
@@ -996,11 +1464,20 @@ func (s *Service) chargeModeration(d *Debate, question, transcript string, spent
 	if charge <= 0 {
 		return
 	}
-	d.ModeratorTokens += charge
 	// Инкремент в хранилище, а не запись d: расход обязан переживать рестарт,
 	// иначе перезапуск машины выдавал бы дебатам свежий бюджет.
 	if err := s.store.AddModeratorTokens(d.ID, charge); err != nil {
+		// Деньги потрачены, а записать это не вышло. Следующий проход перечитает
+		// дебаты и увидит прежний остаток бюджета, поэтому дальше платить нельзя:
+		// отказ хранилища, роняющий и запись результата, и учёт, иначе выдавал бы
+		// каждому повтору полный бюджет заново — критерий отката 2 из
+		// docs/adr/0004-moderator-spend-ceiling.md на ровном месте. Проходы при
+		// этом продолжаются: они станут бесплатными и доведут дебаты до
+		// детерминированного итога, как при исчерпанном бюджете.
 		s.log.Error("учёт расхода модератора", "debate", d.ID, "err", err)
+		s.noteChargeLost(d.ID)
+	} else {
+		d.ModeratorTokens += charge
 	}
 	s.log.Info("расход модератора", "debate", d.ID, "round", d.CurrentRound,
 		"tokens", charge, "reported", spent.Reported(),
@@ -1026,6 +1503,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	storedSummary, storedVerdict, err := moderationMessagesForRound(msgs, d.CurrentRound)
 	if err != nil {
 		s.log.Error("гибрид: неоднозначные сохранённые результаты", "debate", d.ID, "err", err)
+		s.giveUpOnModeration(d.ID)
 		return
 	}
 
@@ -1036,12 +1514,21 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		// объяснения почему.
 		if storedSummary == nil {
 			transcript := renderTranscriptText(msgs)
-			if !s.moderationAllowed(d, subject(d), transcript) {
-				s.log.Warn("гибрид: бюджет дебатов исчерпан, резюме пропущено",
-					"debate", d.ID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
-				if !noticeRecorded(msgs, d.CurrentRound, NoticeBudgetSummary) {
+			if committed := committedDegradation(msgs, d.CurrentRound,
+				NoticeBudgetSummary, NoticeUnavailableSummary); committed != "" {
+				s.log.Info("гибрид: раунд уже объявил пропуск резюме",
+					"debate", d.ID, "round", d.CurrentRound)
+			} else if admission := s.admitModeration(d, subject(d), transcript); admission != admissionAllowed {
+				notice := NoticeBudgetSummary
+				if admission == admissionUnaffordable {
+					notice = NoticeUnavailableSummary
+				} else {
+					s.log.Warn("гибрид: бюджет дебатов исчерпан, резюме пропущено",
+						"debate", d.ID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
+				}
+				if !noticeRecorded(msgs, d.CurrentRound, notice) {
 					s.lock()
-					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, NoticeBudgetSummary)
+					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", SystemSpeakerName, KindSystem, notice)
 					s.unlock()
 				}
 			} else if summary, spent, err := s.summaryCall(ctx, d, transcript, msgs); err != nil {
@@ -1049,7 +1536,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 				s.log.Warn("гибрид: резюме раунда недоступно", "debate", d.ID, "err", err)
 				if !noticeRecorded(msgs, d.CurrentRound, NoticeUnavailableSummary) {
 					s.lock()
-					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, NoticeUnavailableSummary)
+					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", SystemSpeakerName, KindSystem, NoticeUnavailableSummary)
 					s.unlock()
 				}
 			} else {
@@ -1096,30 +1583,54 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	// модель». Иначе развёртывание без ключа отчиталось бы о сработавшем потолке
 	// на каждых дебатах.
 	budgetExhausted := false
-	switch transcript := renderTranscriptText(msgs); {
+	transcript := renderTranscriptText(msgs)
+	committed := committedDegradation(msgs, d.CurrentRound,
+		NoticeBudgetVerdictHybrid, NoticeUnavailableVerdictHybrid)
+	switch {
 	case storedVerdict != nil:
 		verdict = *storedVerdict.Verdict
 		verdictText = storedVerdict.Text
 		speaker = storedVerdict.SpeakerName
-	case !s.moderationAllowed(d, subject(d), transcript):
-		s.log.Warn("гибрид: бюджет дебатов исчерпан, вердикт по голосам",
-			"debate", d.ID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
-		budgetExhausted = true
-		verdictNotice = NoticeBudgetVerdictHybrid
-		verdict, verdictText = hybridVerdict(votes, msgs, consensus, false)
-		speaker = "система"
+	case committed != "":
+		// Раунд уже объявил причину: итог обязан ей соответствовать.
+		budgetExhausted = committed == NoticeBudgetVerdictHybrid
+		verdictNotice = committed
+		verdict, verdictText = hybridVerdict(votes, msgs, consensus, !budgetExhausted)
+		speaker = SystemSpeakerName
 	default:
-		var spent ModerationUsage
-		callCtx, cancelCall := moderationCall(ctx)
-		verdict, spent, err = s.moderator.Verdict(callCtx, subject(d), transcript, messageSeqs(msgs))
-		cancelCall()
-		s.chargeModeration(&d, subject(d), transcript, spent)
-		verdictText = verdict.Text()
-		if err != nil {
-			s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)
-			verdictNotice = NoticeUnavailableVerdictHybrid
-			verdict, verdictText = hybridVerdict(votes, msgs, consensus, true)
-			speaker = "система"
+		switch admission := s.admitModeration(d, subject(d), transcript); admission {
+		case admissionBudgetExhausted, admissionUnaffordable:
+			// Платного вызова не будет. Причина в протоколе — та, что верна: потолок
+			// расхода этих дебатов или недоступность модели по любой другой причине.
+			// Цитата лидера голосования уместна во втором случае и неуместна в
+			// первом. Правило ADR 0004 — цитировать нельзя тогда, когда триггер мог
+			// выбрать участник: исчерпать бюджет длинными репликами может любой, кто
+			// вошёл в дебаты. Отказ платить участник так выбрать не может — для него
+			// нужно сломать запись в хранилище, то есть уронить сервис целиком, — и
+			// потому он стоит рядом с отказом провайдера, а не рядом с бюджетом.
+			budgetExhausted = admission == admissionBudgetExhausted
+			if budgetExhausted {
+				s.log.Warn("гибрид: бюджет дебатов исчерпан, вердикт по голосам",
+					"debate", d.ID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
+				verdictNotice = NoticeBudgetVerdictHybrid
+			} else {
+				verdictNotice = NoticeUnavailableVerdictHybrid
+			}
+			verdict, verdictText = hybridVerdict(votes, msgs, consensus, !budgetExhausted)
+			speaker = SystemSpeakerName
+		default:
+			var spent ModerationUsage
+			callCtx, cancelCall := moderationCall(ctx)
+			verdict, spent, err = s.moderator.Verdict(callCtx, subject(d), transcript, messageSeqs(msgs))
+			cancelCall()
+			s.chargeModeration(&d, subject(d), transcript, spent)
+			verdictText = verdict.Text()
+			if err != nil {
+				s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)
+				verdictNotice = NoticeUnavailableVerdictHybrid
+				verdict, verdictText = hybridVerdict(votes, msgs, consensus, true)
+				speaker = SystemSpeakerName
+			}
 		}
 	}
 	// В hybrid исход консенсуса определяют только голоса участников. Модель
@@ -1129,7 +1640,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	defer s.unlock()
 	if storedVerdict == nil {
 		if verdictNotice != "" && !noticeRecorded(msgs, d.CurrentRound, verdictNotice) {
-			if _, err := s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, verdictNotice); err != nil {
+			if _, err := s.appendMessage(d.ID, d.CurrentRound, "", SystemSpeakerName, KindSystem, verdictNotice); err != nil {
 				s.log.Error("гибрид: сохранение уведомления о деградации", "debate", d.ID, "err", err)
 				return
 			}
@@ -1139,9 +1650,16 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 			return
 		}
 	}
-	s.log.Info("расход модератора за дебаты", "debate", d.ID,
-		"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens,
-		"degraded", budgetExhausted, "verdict_degradation", degradationCause(budgetExhausted, verdictNotice))
+	// attribution — см. одноимённую переменную в moderate.
+	attribution := "observed"
+	switch {
+	case storedVerdict != nil:
+		attribution = "recovered"
+		budgetExhausted, verdictNotice = storedVerdictDegradation(msgs, d.CurrentRound, *storedVerdict,
+			NoticeBudgetVerdictHybrid, NoticeUnavailableVerdictHybrid)
+	case committed != "":
+		attribution = "recovered"
+	}
 	d.Status = StatusConcluded
 	d.Consensus = consensus
 	d.TurnAgentID = ""
@@ -1150,6 +1668,11 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		s.log.Error("гибрид: сохранение статуса", "debate", d.ID, "err", err)
 		return
 	}
+	// Итог расхода — после успешного завершения: см. тот же комментарий в moderate.
+	s.log.Info("расход модератора за дебаты", "debate", d.ID,
+		"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens,
+		"degraded", budgetExhausted, "verdict_degradation", degradationCause(budgetExhausted, verdictNotice),
+		"charge_lost", s.chargeLost(d.ID), "attribution", attribution)
 	s.hub.Publish(Event{Type: EventConcluded, DebateID: d.ID, Round: d.CurrentRound, Consensus: consensus})
 }
 

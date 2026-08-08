@@ -111,6 +111,15 @@ func (s *failingTransitionStorage) UpdateDebate(debate core.Debate) error {
 	return s.Storage.UpdateDebate(debate)
 }
 
+func (s *failingTransitionStorage) failedOnce() bool {
+	select {
+	case <-s.attempted:
+		return true
+	default:
+		return false
+	}
+}
+
 type failingTranscriptReadStorage struct {
 	core.Storage
 	mu        sync.Mutex

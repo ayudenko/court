@@ -3,6 +3,9 @@
 - Status: accepted
 - Date: 2026-08-07
 - Issue: [#3](https://github.com/ayudenko/court/issues/3)
+- Amended by: [ADR 0008](0008-in-process-moderation-retry.md) — the
+  unaccounted-spend bound and the mechanism described under "Spend survives
+  restart" changed when moderation gained an in-process retry
 - Builds on: [ADR 0003](0003-http-rate-limiting.md)
 
 ## Context

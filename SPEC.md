@@ -206,9 +206,9 @@ of the reference implementation, not a hypothetical:
 
 ### A degradation explains itself in the transcript
 
-**A result that a degradation took away is not silently absent.** There are two
-degradations — the moderator was unreachable, and the debate's moderator budget
-was exhausted — and both are recorded the same way in both modes: by a `system`
+**A result that a degradation took away is not silently absent.** Two causes are
+published — the moderator was not used, and the debate's moderator budget was
+exhausted — and both are recorded the same way in both modes: by a `system`
 message in the affected round, preceding the result it explains, at most once per
 round per cause. Six messages exist, and which one appears identifies the cause,
 what was lost, and whether a `verdict` record still follows:
@@ -221,6 +221,18 @@ what was lost, and whether a `verdict` record still follows:
 | `Бюджет модератора на эти дебаты исчерпан, итог зафиксирован без вердикта модели.` | budget | `moderator` mode: the verdict that follows is a deterministic refusal to formulate an outcome, and its `consensus` is whatever the paid summaries established | yes |
 | `Модератор недоступен, итог подведён детерминированно по голосам участников.` | unreachable | `hybrid` mode: the verdict that follows was counted from the votes | yes |
 | `Бюджет модератора на эти дебаты исчерпан, итог подведён детерминированно по голосам участников.` | budget | `hybrid` mode: the verdict that follows was counted from the votes, but unlike the row above its `final_answer` does not quote the leading participant's argument — it points at the transcript instead | yes |
+
+**`unreachable` is the wider of the two causes: it means the moderator was not
+used.** A provider that failed is the common reason, and a server with no key
+configured is the supported one, but the service also declines to call a
+moderator it can still reach when it can no longer account for what a call costs
+— when the write recording a previous charge failed, or when one round has
+already spent more calls on retries than the retry policy allows. The artifact
+does not distinguish those, and deliberately: the alternative is to publish
+`budget` for a debate whose budget is untouched, which is a claim about the
+operator's spend that no consumer can check, because the spend counter is not in
+the artifact. `unreachable` is the cause no stored record contradicts. An operator
+who needs the distinction reads the service log, where it is a separate field.
 
 This is what makes hybrid with no LLM key on the server — a supported deployment
 in which *every* round summary is absent — a readable artifact rather than an
@@ -251,9 +263,14 @@ Three limits are worth stating plainly:
 - **A skipped summary's notice is best-effort.** If writing it fails, the debate
   continues without it and a later round is unaffected. The notices that precede
   a verdict, and the one recording that no verdict will come, are not: if their
-  write fails the debate stays `moderating` rather than concluding unexplained,
-  and is retried when the server next starts. A debate can therefore be observed
-  in `moderating` indefinitely on a server that is not restarted.
+  write fails the debate stays `moderating` rather than concluding unexplained.
+  The running server retries that round on its own until the write succeeds, so
+  `moderating` is a transient state rather than one that waits for a restart.
+  What is bounded is not the retrying but its cost: a retry stops calling the
+  moderator once the debate's spend ceiling is reached, once one round has spent
+  more calls on retries than the policy allows, or once a charge could not be
+  recorded — the first of those produces the `budget` outcome, the other two the
+  `unreachable` one. Retrying itself is free and does not stop.
 
 ## Versioning
 

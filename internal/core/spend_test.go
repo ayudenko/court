@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"court/internal/core"
 	"court/internal/store"
@@ -372,8 +371,11 @@ var errProviderUnreachable = errors.New("anthropic tool call: context deadline e
 
 // TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries охраняет
 // читаемость деградации. Уведомление о бюджете пишется до вердикта, поэтому
-// сбой записи вердикта оставляет уведомление в протоколе; повторная модерация
-// того же раунда после рестарта не имеет права записать его второй раз.
+// сбой записи вердикта оставляет уведомление в протоколе; повторный проход
+// модерации того же раунда не имеет права записать его второй раз.
+//
+// Сервис здесь один и не перезапускается: повтор — свойство работающего
+// процесса, а не рестарта (issue #40).
 func TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "court.db")
 	database, err := store.Open(path)
@@ -389,24 +391,24 @@ func TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries(t *testing.T
 	budget := core.WithModeratorBudget(core.ModeratorBudget{DebateTokens: 1})
 	moderator := &spendingModerator{}
 
-	// Первый проход: запись вердикта падает, уведомление уже в протоколе.
 	failing := &verdictWriteFailure{Storage: database}
-	service := core.NewService(failing, core.NewHub(), moderator, logger, budget)
-	debateID, agents := startedDebate(t, service, core.ModeModerator, 1)
-	playRound(t, service, debateID, agents, "")
-	waitForNotice(t, service, debateID, 1)
-	if debate, err := service.GetDebate(debateID); err != nil || debate.Status != core.StatusModerating {
-		t.Fatalf("после сбоя записи вердикта статус = %s, err = %v", debate.Status, err)
-	}
-
-	// Рестарт поверх той же базы: recover повторяет модерацию того же раунда.
-	restarted := core.NewService(database, core.NewHub(), moderator, logger, budget)
+	service := core.NewService(failing, core.NewHub(), moderator, logger, budget,
+		core.WithBackgroundTuningForTest(testTick, testRetryDelay, testPaidCap))
 	runCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go restarted.Run(runCtx)
-	waitForStatus(t, restarted, debateID, core.StatusConcluded)
+	go service.Run(runCtx)
 
-	messages, err := restarted.Messages(debateID, 0)
+	debateID, agents := startedDebate(t, service, core.ModeModerator, 1)
+	playRound(t, service, debateID, agents, "")
+	waitForStatus(t, service, debateID, core.StatusConcluded)
+
+	if !failing.failedOnce() {
+		t.Fatal("сбой записи вердикта не сработал: повторять было нечего")
+	}
+	if writes := failing.verdictWrites(); writes < 2 {
+		t.Fatalf("попыток записи вердикта: %d, ожидался повтор после сбоя", writes)
+	}
+	messages, err := service.Messages(debateID, 0)
 	if err != nil {
 		t.Fatalf("Messages: %v", err)
 	}
@@ -428,39 +430,42 @@ func TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries(t *testing.T
 }
 
 // verdictWriteFailure роняет первую запись вердикта, оставляя дебаты в статусе
-// moderating — состояние, из которого recover повторяет модерацию.
+// moderating — состояние, из которого фоновый проход повторяет модерацию.
 type verdictWriteFailure struct {
 	core.Storage
-	once sync.Once
+	once   sync.Once
+	mu     sync.Mutex
+	failed bool
+	writes int
 }
 
 func (s *verdictWriteFailure) AddMessage(message core.Message) (int64, error) {
 	if message.Kind == core.KindVerdict {
+		s.mu.Lock()
+		s.writes++
+		s.mu.Unlock()
 		failed := false
 		s.once.Do(func() { failed = true })
 		if failed {
+			s.mu.Lock()
+			s.failed = true
+			s.mu.Unlock()
 			return 0, errors.New("injected verdict write failure")
 		}
 	}
 	return s.Storage.AddMessage(message)
 }
 
-// waitForNotice ждёт появления уведомления о бюджете за указанный раунд.
-func waitForNotice(t *testing.T, service *core.Service, debateID string, round int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		messages, err := service.Messages(debateID, 0)
-		if err != nil {
-			t.Fatalf("Messages: %v", err)
-		}
-		for _, message := range messages {
-			if message.Round == round && message.Kind == core.KindSystem &&
-				strings.Contains(message.Text, "Бюджет модератора") {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("уведомление о бюджете не появилось")
+func (s *verdictWriteFailure) failedOnce() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+// verdictWrites — сколько раз сервис пробовал записать вердикт. Больше одного
+// означает, что повтор действительно случился.
+func (s *verdictWriteFailure) verdictWrites() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writes
 }

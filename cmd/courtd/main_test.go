@@ -691,3 +691,23 @@ func (*countingVerdictModerator) Verdict(
 	return core.ModerationVerdict{FinalAnswer: "Итог модели.", Consensus: true},
 		realisticUsage(question, transcript), nil
 }
+
+// TestReservedModeratorNameIsRefusedAtStartup охраняет различие «вердикт вынес
+// модератор» и «вердикт вынес сервис». По имени говорящего это различие читает и
+// протокол, и сама логика: восстанавливая причину деградации у вердикта,
+// записанного прошлым проходом модерации, сервис смотрит именно на него
+// (docs/adr/0008-in-process-moderation-retry.md). Имя модератора задаёт оператор,
+// поэтому совпадение обязано валить запуск, а не всплывать в артефакте.
+func TestReservedModeratorNameIsRefusedAtStartup(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, name := range []string{core.SystemSpeakerName, " Система ", "СИСТЕМА"} {
+		t.Setenv("COURT_MODERATOR_NAME", name)
+		if _, err := buildModerator(logger); err == nil {
+			t.Fatalf("модератор с именем %q принят молча", name)
+		}
+	}
+	t.Setenv("COURT_MODERATOR_NAME", "Модератор")
+	if _, err := buildModerator(logger); err != nil {
+		t.Fatalf("обычное имя модератора отвергнуто: %v", err)
+	}
+}

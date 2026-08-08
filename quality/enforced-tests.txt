@@ -1,6 +1,10 @@
 # Go package       Test named as enforced in AGENTS.md
 ./internal/core     TestDebateStateMachineReachesConsensus
 ./internal/store    TestTurnOrderSurvivesSubSecondJoinTimes
+./internal/core     TestStuckModerationResumesWithoutRestart
+./internal/core     TestModerationAttemptBookkeepingHoldsTheSinglePass
+./internal/core     TestModerationRetryBacksOff
+./internal/core     TestLateResumeDoesNotRemoderateAConcludedDebate
 ./internal/core     TestAuthenticateRejectsUnknownKey
 ./internal/moderator TestCheckRoundUsesStructuredResult
 ./internal/moderator TestCheckRoundRejectsInvalidStructuredResult
@@ -15,6 +19,11 @@
 ./internal/core     TestModeratorSpendCeilingChargesFailedCalls
 ./internal/core     TestModeratorSpendCeilingDoesNotChargeUnbilledCalls
 ./internal/core     TestModeratorSpendCeilingRecordsOneNoticePerRoundAcrossRetries
+./internal/core     TestModerationRetryWaitsForTheModerationInFlight
+./internal/core     TestPaidRetriesAreCappedAndFreeOnesAreNot
+./internal/core     TestStuckModerationStopsPayingWhenTheChargeIsLost
+./internal/core     TestResumedConclusionKeepsTheDegradationAttribution
+./cmd/courtd        TestReservedModeratorNameIsRefusedAtStartup
 ./internal/moderator TestUsageTravelsWithModerationErrors
 ./internal/moderator TestFixedPromptBytesFitTheBudgetReserve
 ./internal/llm      TestAnthropicCallToolReportsUsage
@@ -43,6 +52,7 @@
 ./internal/api      TestExportedArtifactConformsToSpec
 ./internal/core     TestHybridRecordsEverySkippedModerationResult
 ./internal/core     TestUnavailableModeratorNoticeIsRecordedOncePerRound
+./internal/core     TestARecordedDegradationBindsItsRound
 ./internal/core     TestUnavailableModeratorIsNotReportedAsBudgetDegradation
 ./internal/conformance TestSpecPublishesTheDegradationNoticesTheServiceEmits
 ./internal/store    TestRevocationTombstonesTheRollbackShadow
