@@ -116,12 +116,15 @@ func TestHybridRecordsEverySkippedModerationResult(t *testing.T) {
 }
 
 // TestUnavailableModeratorNoticeIsRecordedOncePerRound охраняет ту же
-// читаемость от противоположного сбоя: повторная модерация раунда — после
-// неудачной записи или после рестарта, возобновляющего дебаты в статусе
-// moderating, — не имеет права записать уведомление второй раз. Случаев четыре,
-// потому что защита стоит в четырёх местах, и точка отказа у каждого своя: после
-// пропущенного резюме идёт переход к следующему раунду, после уведомления о
-// вердикте — запись вердикта в hybrid и переход в concluded в moderator.
+// читаемость от противоположного сбоя: повторный проход модерации раунда,
+// возобновлённый после неудачной записи, не имеет права записать уведомление
+// второй раз. Случаев четыре, потому что защита стоит в четырёх местах, и точка
+// отказа у каждого своя: после пропущенного резюме идёт переход к следующему
+// раунду, после уведомления о вердикте — запись вердикта в hybrid и переход в
+// concluded в moderator.
+//
+// Сервис во всех случаях один: повтор обязан случиться в работающем процессе, а
+// не после рестарта (issue #40).
 func TestUnavailableModeratorNoticeIsRecordedOncePerRound(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
@@ -130,20 +133,15 @@ func TestUnavailableModeratorNoticeIsRecordedOncePerRound(t *testing.T) {
 		notice string
 		// failing оборачивает хранилище так, чтобы первый проход упал уже после
 		// записи уведомления и оставил дебаты в статусе moderating.
-		failing func(core.Storage) core.Storage
+		failing func(core.Storage) stuckStorage
 	}{
 		{
 			name:   "hybrid: падает переход к следующему раунду",
 			mode:   core.ModeHybrid,
 			rounds: 2,
 			notice: noticeSkippedSummary,
-			failing: func(storage core.Storage) core.Storage {
-				return &failingTransitionStorage{
-					Storage:   storage,
-					status:    core.StatusRunning,
-					round:     2,
-					attempted: make(chan struct{}),
-				}
+			failing: func(storage core.Storage) stuckStorage {
+				return newFailingTransition(core.StatusRunning, 2, storage)
 			},
 		},
 		{
@@ -151,7 +149,7 @@ func TestUnavailableModeratorNoticeIsRecordedOncePerRound(t *testing.T) {
 			mode:   core.ModeHybrid,
 			rounds: 1,
 			notice: noticeVotedVerdict,
-			failing: func(storage core.Storage) core.Storage {
+			failing: func(storage core.Storage) stuckStorage {
 				return &verdictWriteFailure{Storage: storage}
 			},
 		},
@@ -160,13 +158,8 @@ func TestUnavailableModeratorNoticeIsRecordedOncePerRound(t *testing.T) {
 			mode:   core.ModeModerator,
 			rounds: 2,
 			notice: noticeSkippedSummary,
-			failing: func(storage core.Storage) core.Storage {
-				return &failingTransitionStorage{
-					Storage:   storage,
-					status:    core.StatusRunning,
-					round:     2,
-					attempted: make(chan struct{}),
-				}
+			failing: func(storage core.Storage) stuckStorage {
+				return newFailingTransition(core.StatusRunning, 2, storage)
 			},
 		},
 		{
@@ -174,53 +167,36 @@ func TestUnavailableModeratorNoticeIsRecordedOncePerRound(t *testing.T) {
 			mode:   core.ModeModerator,
 			rounds: 1,
 			notice: noticeVerdictWithheld,
-			failing: func(storage core.Storage) core.Storage {
-				return &failingTransitionStorage{
-					Storage:   storage,
-					status:    core.StatusConcluded,
-					round:     1,
-					attempted: make(chan struct{}),
-				}
+			failing: func(storage core.Storage) stuckStorage {
+				return newFailingTransition(core.StatusConcluded, 1, storage)
 			},
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "court.db")
-			database, err := store.Open(path)
-			if err != nil {
-				t.Fatalf("store.Open: %v", err)
-			}
-			t.Cleanup(func() {
-				if err := database.Close(); err != nil {
-					t.Errorf("store.Close: %v", err)
-				}
-			})
+			database := openTestStore(t)
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			moderator := unavailableModerator{}
+			failing := testCase.failing(database)
 
-			// Первый проход: уведомление уже в протоколе, итог не доехал.
-			service := core.NewService(testCase.failing(database), core.NewHub(), moderator, logger)
+			service := core.NewService(failing, core.NewHub(), unavailableModerator{}, logger,
+				core.WithBackgroundTuningForTest(testTick, testRetryDelay, testPaidCap))
+			runCtx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			go service.Run(runCtx)
+
 			debateID, agents := startedDebate(t, service, testCase.mode, testCase.rounds)
 			playRound(t, service, debateID, agents, "")
 			waitForNoticeText(t, service, debateID, testCase.notice)
-			if debate, err := service.GetDebate(debateID); err != nil || debate.Status != core.StatusModerating {
-				t.Fatalf("после сбоя записи статус = %s, err = %v", debate.Status, err)
-			}
-
-			// Рестарт поверх той же базы: recover повторяет модерацию раунда.
-			restarted := core.NewService(database, core.NewHub(), moderator, logger)
-			runCtx, cancel := context.WithCancel(context.Background())
-			t.Cleanup(cancel)
-			go restarted.Run(runCtx)
 			// Раунд, на котором упала запись, повторяется целиком; если после него
-			// дебаты ещё не кончились, оставшиеся ходы доигрываются вторым
-			// сервисом.
+			// дебаты ещё не кончились, оставшиеся ходы доигрываются.
 			for round := 2; round <= testCase.rounds; round++ {
-				playRound(t, restarted, debateID, agents, "")
+				playRound(t, service, debateID, agents, "")
 			}
-			waitForStatus(t, restarted, debateID, core.StatusConcluded)
+			waitForStatus(t, service, debateID, core.StatusConcluded)
 
-			messages, err := restarted.Messages(debateID, 0)
+			if !failing.failedOnce() {
+				t.Fatal("сбой записи не сработал: повторять было нечего")
+			}
+			messages, err := service.Messages(debateID, 0)
 			if err != nil {
 				t.Fatalf("Messages: %v", err)
 			}
@@ -278,6 +254,9 @@ func TestUnavailableModeratorIsNotReportedAsBudgetDegradation(t *testing.T) {
 				playRound(t, service, debateID, agents, "")
 				waitForStatus(t, service, debateID, core.StatusConcluded)
 
+				// Строка пишется после успешного перехода в concluded, поэтому
+				// наблюдатель статуса может обогнать её.
+				waitForLogLine(t, records, "расход модератора за дебаты")
 				attributes, found := records.find("расход модератора за дебаты")
 				if !found {
 					t.Fatalf("итоговая строка расхода не записана; ADR 0004 считает критерий по ней")

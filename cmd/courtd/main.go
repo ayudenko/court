@@ -235,6 +235,15 @@ func buildModerator(log *slog.Logger) (core.Moderator, error) {
 	providerName := envOr("COURT_MODERATOR_PROVIDER", "anthropic")
 	model := envOr("COURT_MODERATOR_MODEL", "claude-opus-5")
 	name := envOr("COURT_MODERATOR_NAME", "Модератор")
+	// Имя «система» зарезервировано за записями сервиса. По нему сервис отличает
+	// вердикт модели от собственного — в том числе восстанавливая причину
+	// деградации у вердикта, записанного прошлым проходом модерации
+	// (docs/adr/0008-in-process-moderation-retry.md), — и читатель протокола
+	// отличает их так же. Модератор с таким именем стёр бы это различие.
+	if strings.EqualFold(strings.TrimSpace(name), core.SystemSpeakerName) {
+		return nil, fmt.Errorf("COURT_MODERATOR_NAME: имя %q зарезервировано за записями сервиса",
+			core.SystemSpeakerName)
+	}
 	// Явный ключ модератора; если пуст, SDK возьмёт стандартную переменную
 	// провайдера (ANTHROPIC_API_KEY / OPENAI_API_KEY).
 	apiKey := os.Getenv("COURT_MODERATOR_API_KEY")
