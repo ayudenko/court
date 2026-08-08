@@ -127,6 +127,24 @@ var scenarios = []scenario{
 		moderator: scriptedModerator{consensus: false},
 	},
 	{
+		// Развёртывание hybrid без LLM-ключа на сервере: заявленный путь с
+		// нулевой себестоимостью. Трасса записана, потому что этот артефакт —
+		// единственная форма, по которой такой сервер судят, и без неё
+		// «деградация оставляет след» осталась бы утверждением о коде, а не
+		// свойством, наблюдаемым в эталоне.
+		name:        "hybrid_no_moderator_v1.jsonl",
+		stage:       stageConcluded,
+		mode:        core.ModeHybrid,
+		rounds:      2,
+		question:    "Does a debate without an LLM key say why its summaries are missing?",
+		description: "No moderator is reachable, so every skipped result has to explain itself.",
+		arguments: [2]string{
+			"A trace with no summaries must not look like a truncated one.",
+			"Then the absence itself belongs in the transcript.",
+		},
+		moderator: scriptedModerator{unavailable: true},
+	},
+	{
 		name:        "hybrid_split_vote_v1.jsonl",
 		stage:       stageConcluded,
 		mode:        core.ModeHybrid,
@@ -291,7 +309,14 @@ func (ids *deterministicIDs) next(prefix string) string {
 
 type scriptedModerator struct {
 	consensus bool
+	// unavailable воспроизводит сервер без LLM-ключа: каждый вызов модератора
+	// возвращает ошибку, и итог раунда с вердиктом деградируют.
+	unavailable bool
 }
+
+// errNoModeratorKey — отказ до вызова провайдера, а не отказ провайдера: расход
+// не сообщается и не списывается, поэтому трасса остаётся о протоколе.
+var errNoModeratorKey = errors.New("moderator key is not configured")
 
 func (scriptedModerator) Name() string { return "Fixture Moderator" }
 
@@ -302,6 +327,9 @@ func (moderator scriptedModerator) CheckRound(
 	_ int,
 	allowedSeqs []int64,
 ) (core.RoundSummary, core.ModerationUsage, error) {
+	if moderator.unavailable {
+		return core.RoundSummary{}, core.ModerationUsage{}, errNoModeratorKey
+	}
 	// Расход не сообщается и вызов не помечен оплаченным: golden-трассы фиксируют
 	// протокол, а не стоимость, поэтому бюджет здесь не расходуется вовсе.
 	return core.RoundSummary{
@@ -331,6 +359,9 @@ func (moderator scriptedModerator) Verdict(
 	_ string,
 	allowedSeqs []int64,
 ) (core.ModerationVerdict, core.ModerationUsage, error) {
+	if moderator.unavailable {
+		return core.ModerationVerdict{}, core.ModerationUsage{}, errNoModeratorKey
+	}
 	return core.ModerationVerdict{
 		FinalAnswer: "Use deterministic record/replay fixtures as protocol evidence.",
 		Claims: []core.ModerationClaim{{

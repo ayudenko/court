@@ -41,5 +41,9 @@
 ./internal/conformance TestSpecStatesTheLimitsItIsCheckedAgainst
 ./internal/conformance TestCheckRecordsEnforcesTheWholeStream
 ./internal/api      TestExportedArtifactConformsToSpec
+./internal/core     TestHybridRecordsEverySkippedModerationResult
+./internal/core     TestUnavailableModeratorNoticeIsRecordedOncePerRound
+./internal/core     TestUnavailableModeratorIsNotReportedAsBudgetDegradation
+./internal/conformance TestSpecPublishesTheDegradationNoticesTheServiceEmits
 ./internal/store    TestRevocationTombstonesTheRollbackShadow
 ./internal/store    TestTombstonedShadowSurvivesThePreviousBinaryMigration

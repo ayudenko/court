@@ -42,7 +42,7 @@ below it is caught by review, not by `make check`.
 
 ## Reference artifacts
 
-Six traces in `internal/golden/testdata` are the evidence this document is
+Seven traces in `internal/golden/testdata` are the evidence this document is
 written over. They are recorded by running the real service — the same consistent
 snapshot and the same producer that `GET /api/debates/{id}/export` uses — so they
 cannot describe a format the server does not emit. Regenerate them with `make
@@ -56,6 +56,7 @@ golden`; never edit them by hand.
 | `moderator_consensus_v1.jsonl` | Moderator mode ending early on consensus, with a structured summary and verdict |
 | `hybrid_split_vote_v1.jsonl` | Hybrid mode where the participants keep their own positions and no consensus is reached |
 | `hybrid_multi_round_v1.jsonl` | A debate crossing two round boundaries: summaries closing rounds 1 and 2, then the verdict in round 3 |
+| `hybrid_no_moderator_v1.jsonl` | A hybrid debate on a server with no LLM key: no summary in any round, a `system` message explaining each absence, and a verdict derived from the votes |
 
 ## The artifact
 
@@ -184,13 +185,16 @@ of the reference implementation, not a hypothetical:
   mode, an unavailable moderator concludes the debate with a `system` message and
   no `verdict` record. C7 bounds where a verdict may appear; nothing requires one
   to exist.
-- **A round does not necessarily have a summary.** The moderator may be
-  unavailable, or the debate's moderator budget may be exhausted.
+- **A round does not necessarily have a summary.** A round still in progress, or
+  a round that ends the debate, has none by design; otherwise the moderator may
+  have been unavailable or the debate's moderator budget exhausted, and those two
+  cases say so in the transcript. See below for how to tell them apart.
 - **A verdict is not necessarily the model's.** A verdict whose `speaker_name` is
   `система` was produced deterministically — from the votes in `hybrid`, or as an
-  explicit refusal to formulate an outcome in `moderator` mode. Outside the
-  budget case below, `speaker_name` is the only signal that distinguishes it, and
-  it is not a rule: a moderator could in principle be named that way.
+  explicit refusal to formulate an outcome in `moderator` mode. The reference
+  implementation also records why, in the `system` message preceding it, but
+  neither that message nor `speaker_name` is a rule: a moderator could in
+  principle be named that way.
 - **A round does not necessarily contain an argument from every participant.**
   See skipped turns above.
 - **`current_round` is not the number of completed rounds.** It is the round in
@@ -200,24 +204,56 @@ of the reference implementation, not a hypothetical:
   external participant's model at all. Tracked as issue #33.
 - **Timestamps are not an ordering authority.** See `seq` above.
 
-### Degradations are not uniformly recorded
+### A degradation explains itself in the transcript
 
-Which degradations leave a trace in the transcript differs by mode, and a
-consumer must not assume the general case. Budget exhaustion is recorded in both
-modes, at most once per round, by a `system` message preceding the affected
-result. An unavailable moderator is recorded only in `moderator` mode.
+**A result that a degradation took away is not silently absent.** There are two
+degradations — the moderator was unreachable, and the debate's moderator budget
+was exhausted — and both are recorded the same way in both modes: by a `system`
+message in the affected round, preceding the result it explains, at most once per
+round per cause. Six messages exist, and which one appears identifies the cause,
+what was lost, and whether a `verdict` record still follows:
 
-In `hybrid` mode an unavailable moderator leaves **no** transcript record: the
-round summary is silently absent, and the final verdict is derived from the votes
-and attributed to `система`. This matters because hybrid with no LLM key on the
-server is a supported deployment, in which every round summary is absent and
-nothing in the artifact says why. A reader of a hybrid trace therefore cannot
-distinguish "no summary was produced" from "a summary was lost", and must not
-treat missing summaries as evidence of a truncated transcript.
+| Message | Cause | What it means | Verdict follows |
+|---|---|---|---|
+| `Модератор недоступен, дискуссия продолжается без промежуточного итога.` | unreachable | This round has no summary | — |
+| `Бюджет модератора на эти дебаты исчерпан, дискуссия продолжается без промежуточного итога.` | budget | This round has no summary | — |
+| `Модератор недоступен, дебаты завершены без вердикта.` | unreachable | `moderator` mode: the debate concludes with no verdict at all | no |
+| `Бюджет модератора на эти дебаты исчерпан, итог зафиксирован без вердикта модели.` | budget | `moderator` mode: the verdict that follows is a deterministic refusal to formulate an outcome, and its `consensus` is whatever the paid summaries established | yes |
+| `Модератор недоступен, итог подведён детерминированно по голосам участников.` | unreachable | `hybrid` mode: the verdict that follows was counted from the votes | yes |
+| `Бюджет модератора на эти дебаты исчерпан, итог подведён детерминированно по голосам участников.` | budget | `hybrid` mode: the verdict that follows was counted from the votes, but unlike the row above its `final_answer` does not quote the leading participant's argument — it points at the transcript instead | yes |
 
-This asymmetry is a property of the current implementation rather than an
-intended guarantee; it is documented here because a consumer would otherwise
-encode the opposite assumption. Tracked as issue #36.
+This is what makes hybrid with no LLM key on the server — a supported deployment
+in which *every* round summary is absent — a readable artifact rather than an
+apparently truncated one. `hybrid_no_moderator_v1.jsonl` is that deployment
+recorded.
+
+**A summary absent for any other reason is absent by design, and says nothing.**
+A round that ends the debate has no summary, because the verdict is its result: a
+last round, or in `hybrid` a round the votes concluded unanimously. So the absence
+of a summary is not by itself evidence of a degradation — the presence of one of
+the two messages above is. `hybrid_split_vote_v1.jsonl` is the by-design case:
+one round, no summary, no `system` message, a verdict.
+
+Three limits are worth stating plainly:
+
+- **This is not normative.** No `C` rule constrains how a degradation is
+  recorded, so an artifact from another implementation that omits these messages
+  still conforms. Making them normative would oblige every implementation to emit
+  these particular Russian sentences, which is a property of this server rather
+  than of the protocol. What the rules guarantee is only that a summary or a
+  verdict may be absent (C6, C7).
+- **The distinction is carried in prose `text`.** A `system` message has no
+  `result`, and adding a structured degradation marker would be a field addition
+  rather than a description of what the server emits today. A consumer that needs
+  to detect degradation programmatically therefore has to match these strings —
+  which is why they are reproduced verbatim here and pinned to the service's own
+  constants by a test.
+- **A skipped summary's notice is best-effort.** If writing it fails, the debate
+  continues without it and a later round is unaffected. The notices that precede
+  a verdict, and the one recording that no verdict will come, are not: if their
+  write fails the debate stays `moderating` rather than concluding unexplained,
+  and is retried when the server next starts. A debate can therefore be observed
+  in `moderating` indefinitely on a server that is not restarted.
 
 ## Versioning
 
