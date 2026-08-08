@@ -37,19 +37,50 @@ const (
 	ModerationPromptOverheadBytes = 4096
 )
 
-// Сообщения протокола о деградации по бюджету. Читатель протокола обязан
-// отличать вердикт модели от вердикта по голосам, поэтому деградация всегда
-// оставляет след в протоколе, а не только в логах.
+// Сообщения протокола о деградации. Читатель протокола обязан отличать вердикт
+// модели от вердикта по голосам и пропущенный итог от потерянного, поэтому
+// каждая деградация оставляет след в протоколе, а не только в логах — в обоих
+// режимах и по обеим причинам. Асимметрия между режимами была бы неотличима от
+// усечённого протокола: см. docs/adr/0007-protocol-conformance-suite.md.
+//
+// Экспортируются не ради вызывающего кода, а потому что SPEC.md публикует эти
+// строки как то, что потребитель артефакта сопоставляет. Расхождение документа с
+// кодом обязано падать в CI, а не у потребителя:
+// TestSpecPublishesTheDegradationNoticesTheServiceEmits.
 const (
-	noticeBudgetSummary = "Бюджет модератора на эти дебаты исчерпан, " +
+	NoticeBudgetSummary = "Бюджет модератора на эти дебаты исчерпан, " +
 		"дискуссия продолжается без промежуточного итога."
 	// Тексты вердикта различаются по режиму, потому что различается механизм:
 	// в hybrid исход определяют голоса участников, в moderator — нет.
-	noticeBudgetVerdictModerator = "Бюджет модератора на эти дебаты исчерпан, " +
+	NoticeBudgetVerdictModerator = "Бюджет модератора на эти дебаты исчерпан, " +
 		"итог зафиксирован без вердикта модели."
-	noticeBudgetVerdictHybrid = "Бюджет модератора на эти дебаты исчерпан, " +
+	NoticeBudgetVerdictHybrid = "Бюджет модератора на эти дебаты исчерпан, " +
+		"итог подведён детерминированно по голосам участников."
+	// Недоступность модератора: провайдер вернул ошибку либо ключа нет вовсе.
+	// Развёртывание hybrid без LLM-ключа — поддерживаемый сценарий, в котором
+	// таким оказывается каждый раунд, и именно там молчание протокола дороже
+	// всего.
+	NoticeUnavailableSummary = "Модератор недоступен, " +
+		"дискуссия продолжается без промежуточного итога."
+	NoticeUnavailableVerdictModerator = "Модератор недоступен, " +
+		"дебаты завершены без вердикта."
+	NoticeUnavailableVerdictHybrid = "Модератор недоступен, " +
 		"итог подведён детерминированно по голосам участников."
 )
+
+// DegradationNotices — полный набор уведомлений о деградации. Существует, чтобы
+// SPEC.md проверялся против всех строк, а не против тех, которые автор документа
+// вспомнил.
+func DegradationNotices() []string {
+	return []string{
+		NoticeBudgetSummary,
+		NoticeBudgetVerdictModerator,
+		NoticeBudgetVerdictHybrid,
+		NoticeUnavailableSummary,
+		NoticeUnavailableVerdictModerator,
+		NoticeUnavailableVerdictHybrid,
+	}
+}
 
 // ModeratorBudget ограничивает суммарный расход LLM-модератора на одни дебаты.
 // Смысл потолка: стоимость одних дебатов должна быть конечной и известной
@@ -687,9 +718,9 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			// детерминированным вердиктом.
 			s.log.Warn("модерация: бюджет дебатов исчерпан, итог раунда пропущен",
 				"debate", debateID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
-			if !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetSummary) {
+			if !noticeRecorded(msgs, d.CurrentRound, NoticeBudgetSummary) {
 				s.lock()
-				_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, noticeBudgetSummary)
+				_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, NoticeBudgetSummary)
 				s.unlock()
 			}
 		} else {
@@ -700,8 +731,9 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			s.lock()
 			if err != nil {
 				s.log.Error("модерация: итог раунда", "debate", debateID, "err", err)
-				_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
-					"Модератор недоступен, дискуссия продолжается без промежуточного итога.")
+				if !noticeRecorded(msgs, d.CurrentRound, NoticeUnavailableSummary) {
+					_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, NoticeUnavailableSummary)
+				}
 			} else {
 				summary.Consensus = roundSummaryReachedConsensus(summary)
 				consensus = summary.Consensus
@@ -744,6 +776,9 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 		}
 		s.lock()
 		defer s.unlock()
+		// Причина, по которой итог подведён не моделью. Пустая строка — вердикт
+		// модели. Отдельно от degraded: см. degradationCause.
+		verdictNotice := ""
 		switch {
 		case degraded:
 			// consensus здесь остаётся тем, что определили оплаченные итоги
@@ -752,8 +787,9 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			// поддержку, считается голосующим за себя, — и подсчёт отдал бы исход
 			// чужих дебатов любому, кто в них вошёл.
 			degradedVerdict, verdictText := budgetExhaustedVerdict(consensus)
-			if !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetVerdictModerator) {
-				if _, err := s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, noticeBudgetVerdictModerator); err != nil {
+			verdictNotice = NoticeBudgetVerdictModerator
+			if !noticeRecorded(msgs, d.CurrentRound, NoticeBudgetVerdictModerator) {
+				if _, err := s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem, NoticeBudgetVerdictModerator); err != nil {
 					s.log.Error("модерация: сохранение уведомления о бюджете", "debate", debateID, "err", err)
 					return
 				}
@@ -764,8 +800,18 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			}
 		case err != nil:
 			s.log.Error("модерация: вердикт", "debate", debateID, "err", err)
-			_, _ = s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
-				"Модератор недоступен, дебаты завершены без вердикта.")
+			verdictNotice = NoticeUnavailableVerdictModerator
+			// Отказ, а не завершение: без вердикта уведомление — единственная
+			// запись, объясняющая исход, и дебаты, завершённые без неё, ничем не
+			// отличаются от усечённого протокола. Дебаты остаются в moderating, и
+			// recover повторит попытку.
+			if !noticeRecorded(msgs, d.CurrentRound, NoticeUnavailableVerdictModerator) {
+				if _, err := s.appendMessage(debateID, d.CurrentRound, "", "система", KindSystem,
+					NoticeUnavailableVerdictModerator); err != nil {
+					s.log.Error("модерация: сохранение уведомления о недоступности", "debate", debateID, "err", err)
+					return
+				}
+			}
 		case storedVerdict == nil:
 			consensus = verdict.Consensus
 			if _, err := s.appendVerdict(debateID, d.CurrentRound, s.moderator.Name(), verdict); err != nil {
@@ -776,7 +822,8 @@ func (s *Service) moderate(ctx context.Context, debateID string) {
 			consensus = verdict.Consensus
 		}
 		s.log.Info("расход модератора за дебаты", "debate", debateID,
-			"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens, "degraded", degraded)
+			"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens,
+			"degraded", degraded, "verdict_degradation", degradationCause(degraded, verdictNotice))
 		d.Status = StatusConcluded
 		d.Consensus = consensus
 		d.TurnAgentID = ""
@@ -841,10 +888,32 @@ func budgetExhaustedVerdict(consensus bool) (ModerationVerdict, string) {
 	}, sb.String()
 }
 
-// budgetNoticeRecorded сообщает, есть ли уже в протоколе уведомление о бюджете
-// за этот раунд. Повторная модерация после сбоя записи не должна дублировать
-// запись, на которой держится читаемость деградации.
-func budgetNoticeRecorded(msgs []Message, round int, notice string) bool {
+// degradationCause — причина, по которой вердикт подведён не моделью, для лога.
+// Отдельный ключ, потому что `degraded` в той же строке значит именно «сработал
+// потолок расхода»: по нему считается критерий отката 1 из
+// docs/adr/0004-moderator-spend-ceiling.md, и расширение его смысла до «модель не
+// сработала» сделало бы этот счётчик в развёртывании без LLM-ключа всегда
+// положительным.
+//
+// Говорит только о вердикте — отсюда имя ключа `verdict_degradation`. Дебаты,
+// потерявшие резюме раундов, но получившие вердикт модели, дают здесь `none`, и
+// искать по этому ключу все деградировавшие дебаты нельзя.
+func degradationCause(budgetExhausted bool, verdictNotice string) string {
+	switch {
+	case budgetExhausted:
+		return "budget"
+	case verdictNotice != "":
+		return "unavailable"
+	default:
+		return "none"
+	}
+}
+
+// noticeRecorded сообщает, есть ли уже в протоколе это уведомление о деградации
+// за этот раунд. Повторная модерация — после сбоя записи или после рестарта,
+// возобновляющего дебаты в статусе moderating, — не должна дублировать запись,
+// на которой держится читаемость деградации.
+func noticeRecorded(msgs []Message, round int, notice string) bool {
 	for _, message := range msgs {
 		if message.Round == round && message.Kind == KindSystem && message.Text == notice {
 			return true
@@ -961,20 +1030,28 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	}
 
 	if storedVerdict == nil && !lastRound && !consensus {
-		// Промежуточное резюме — опциональный слой: без LLM просто едем дальше.
+		// Промежуточное резюме — опциональный слой: без LLM дебаты едут дальше.
+		// Но «едут дальше» не значит «молча»: пропуск записывается, иначе
+		// развёртывание без ключа отдаёт протокол без единого резюме и без
+		// объяснения почему.
 		if storedSummary == nil {
 			transcript := renderTranscriptText(msgs)
 			if !s.moderationAllowed(d, subject(d), transcript) {
 				s.log.Warn("гибрид: бюджет дебатов исчерпан, резюме пропущено",
 					"debate", d.ID, "round", d.CurrentRound, "spent", d.ModeratorTokens)
-				if !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetSummary) {
+				if !noticeRecorded(msgs, d.CurrentRound, NoticeBudgetSummary) {
 					s.lock()
-					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, noticeBudgetSummary)
+					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, NoticeBudgetSummary)
 					s.unlock()
 				}
 			} else if summary, spent, err := s.summaryCall(ctx, d, transcript, msgs); err != nil {
 				s.chargeModeration(&d, subject(d), transcript, spent)
 				s.log.Warn("гибрид: резюме раунда недоступно", "debate", d.ID, "err", err)
+				if !noticeRecorded(msgs, d.CurrentRound, NoticeUnavailableSummary) {
+					s.lock()
+					_, _ = s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, NoticeUnavailableSummary)
+					s.unlock()
+				}
 			} else {
 				s.chargeModeration(&d, subject(d), transcript, spent)
 				// In hybrid mode only participant votes decide consensus. Preserve that
@@ -1008,6 +1085,16 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	var verdict ModerationVerdict
 	verdictText := ""
 	speaker := s.moderator.Name()
+	// Уведомление, которое обязано предшествовать вердикту, если его подвела не
+	// модель. Пустая строка — вердикт модели, объяснять нечего. Одна переменная
+	// на обе причины: читателю протокола нужна причина, а не только тот факт,
+	// что говорит «система».
+	verdictNotice := ""
+	// budgetExhausted — отдельный флаг, а не производная от verdictNotice: по нему
+	// считается критерий отката 1 из docs/adr/0004-moderator-spend-ceiling.md, и
+	// он обязан значить «сработал потолок расхода», а не «вердикт подвела не
+	// модель». Иначе развёртывание без ключа отчиталось бы о сработавшем потолке
+	// на каждых дебатах.
 	budgetExhausted := false
 	switch transcript := renderTranscriptText(msgs); {
 	case storedVerdict != nil:
@@ -1018,6 +1105,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		s.log.Warn("гибрид: бюджет дебатов исчерпан, вердикт по голосам",
 			"debate", d.ID, "spent", d.ModeratorTokens, "budget", s.budget.DebateTokens)
 		budgetExhausted = true
+		verdictNotice = NoticeBudgetVerdictHybrid
 		verdict, verdictText = hybridVerdict(votes, msgs, consensus, false)
 		speaker = "система"
 	default:
@@ -1029,6 +1117,7 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		verdictText = verdict.Text()
 		if err != nil {
 			s.log.Warn("гибрид: LLM-вердикт недоступен, использую подсчёт голосов", "debate", d.ID, "err", err)
+			verdictNotice = NoticeUnavailableVerdictHybrid
 			verdict, verdictText = hybridVerdict(votes, msgs, consensus, true)
 			speaker = "система"
 		}
@@ -1039,9 +1128,9 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 	s.lock()
 	defer s.unlock()
 	if storedVerdict == nil {
-		if budgetExhausted && !budgetNoticeRecorded(msgs, d.CurrentRound, noticeBudgetVerdictHybrid) {
-			if _, err := s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, noticeBudgetVerdictHybrid); err != nil {
-				s.log.Error("гибрид: сохранение уведомления о бюджете", "debate", d.ID, "err", err)
+		if verdictNotice != "" && !noticeRecorded(msgs, d.CurrentRound, verdictNotice) {
+			if _, err := s.appendMessage(d.ID, d.CurrentRound, "", "система", KindSystem, verdictNotice); err != nil {
+				s.log.Error("гибрид: сохранение уведомления о деградации", "debate", d.ID, "err", err)
 				return
 			}
 		}
@@ -1051,7 +1140,8 @@ func (s *Service) moderateHybrid(ctx context.Context, d Debate) {
 		}
 	}
 	s.log.Info("расход модератора за дебаты", "debate", d.ID,
-		"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens, "degraded", budgetExhausted)
+		"tokens", d.ModeratorTokens, "budget", s.budget.DebateTokens,
+		"degraded", budgetExhausted, "verdict_degradation", degradationCause(budgetExhausted, verdictNotice))
 	d.Status = StatusConcluded
 	d.Consensus = consensus
 	d.TurnAgentID = ""

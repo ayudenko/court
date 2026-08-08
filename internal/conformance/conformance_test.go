@@ -152,6 +152,29 @@ func TestSpecStatesTheLimitsItIsCheckedAgainst(t *testing.T) {
 	}
 }
 
+// TestSpecPublishesTheDegradationNoticesTheServiceEmits pins the degradation
+// messages for the same reason as the bounds above. SPEC.md tells a consumer to
+// match these strings, because a `system` message carries no structured result —
+// so a reworded notice is a silent break of every consumer that followed the
+// document. Neither the rule-identifier test nor the golden traces catch it: the
+// text is descriptive prose, and only two of the six appear in a trace.
+func TestSpecPublishesTheDegradationNoticesTheServiceEmits(t *testing.T) {
+	spec, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatalf("read SPEC.md: %v", err)
+	}
+	notices := core.DegradationNotices()
+	if len(notices) != 6 {
+		t.Fatalf("degradation notices = %d; SPEC.md states there are six", len(notices))
+	}
+	for _, notice := range notices {
+		if !strings.Contains(string(spec), notice) {
+			t.Errorf("SPEC.md does not publish the degradation notice %q", notice)
+		}
+	}
+	requireNoDuplicates(t, "degradation notices", notices)
+}
+
 // TestCheckRecordsEnforcesTheWholeStream covers the entry point a foreign
 // harness reaches for when it decoded the artifact itself. Records that are each
 // individually valid can still not form a stream, and answering that with a

@@ -725,9 +725,18 @@ func TestStructuredModerationWriteFailurePreventsStateTransition(t *testing.T) {
 		name     string
 		failKind string
 		rounds   int
+		// moderator по умолчанию consensusModerator: он доводит дебаты до записи
+		// резюме и вердикта. Случай с уведомлением о деградации требует
+		// противоположного — модератора, который не отвечает вовсе.
+		moderator core.Moderator
 	}{
 		{name: "summary", failKind: core.KindSummary, rounds: 2},
 		{name: "verdict", failKind: core.KindVerdict, rounds: 1},
+		// Уведомление о недоступности модератора — единственная запись, которая
+		// объяснит исход дебатов, завершённых без вердикта. Дебаты, доехавшие до
+		// concluded без неё, неотличимы от усечённого протокола, то есть ровно тот
+		// дефект, ради которого деградацию стали записывать (issue #36).
+		{name: "degradation notice", failKind: core.KindSystem, rounds: 1, moderator: unavailableModerator{}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			database, err := store.Open(filepath.Join(t.TempDir(), "court.db"))
@@ -739,7 +748,11 @@ func TestStructuredModerationWriteFailurePreventsStateTransition(t *testing.T) {
 				Storage: database, failKind: tt.failKind, attempted: make(chan struct{}),
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			service := core.NewService(failing, core.NewHub(), consensusModerator{}, logger)
+			var moderator core.Moderator = consensusModerator{}
+			if tt.moderator != nil {
+				moderator = tt.moderator
+			}
+			service := core.NewService(failing, core.NewHub(), moderator, logger)
 			creator := registerAgent(t, service, "creator")
 			challenger := registerAgent(t, service, "challenger")
 			created, err := service.CreateDebate(creator, core.CreateDebateParams{
